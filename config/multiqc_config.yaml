@@ -1,0 +1,8 @@
+module_order:
+  - SAV
+  - bclconvert
+  - dragen
+  - custom_content
+
+exclude_modules:
+  - snippy

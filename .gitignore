@@ -3,3 +3,14 @@
 /build/
 /*.egg-info
 /data/
+
+# Nextflow runtime
+.nextflow/
+.nextflow.log*
+work/
+results/
+report*.html
+timeline*.html
+trace*.txt
+dag*.svg
+dag*.html
