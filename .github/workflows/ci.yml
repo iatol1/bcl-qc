@@ -32,7 +32,7 @@ jobs:
 
       - name: Lint and syntax check
         run: |
-          python -m py_compile bclqc.py picard_qcsum.py tests/test_picard_qcsum.py
+          python -m py_compile bclqc.py tests/test_bclqc.py
           ruff check .
 
       - name: Run unit and integration tests

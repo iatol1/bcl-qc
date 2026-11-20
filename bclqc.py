@@ -1,151 +1,525 @@
+#!/usr/bin/env python3
+"""
+Unified CLI and library for BCL demux, DRAGEN alignment, Picard CollectHsMetrics
+QC summaries, and MultiQC reporting.
+
+Subcommands:
+  bclqc.py run    --run-dir RUN [--sampleinfo FILE] [--steps demux align qc]
+  bclqc.py demux  --run-dir RUN [--fastqs-dir DIR]
+  bclqc.py align  --run-dir RUN [--fastqs-dir DIR] [--bams-dir DIR]
+  bclqc.py qc     --run-dir RUN --sampleinfo FILE [--fastqs-dir DIR] [--bams-dir DIR]
+  bclqc.py qcsum  CRAM [CRAM ...] --panel PANEL [-o DIR] [-s SAMPLE_ID]
+  bclqc.py merge  FILE [FILE ...] [-o DIR] [--output NAME]
+  bclqc.py panels
+"""
+
+from __future__ import annotations
+
 import argparse
+import csv
 import glob
-import logging  # For more robust logging
+import logging
+import math
 import os
-import shlex  # For safely constructing shell commands
+import shlex
 import subprocess
-from multiprocessing import Pool
+import sys
+import tempfile
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
 
-import matplotlib.pyplot as plt
-import pandas as pd
-import seaborn as sns
-from interop import py_interop_run, py_interop_run_metrics, py_interop_table
-from numpy import float32, zeros
+import yaml
 
-from picard_qcsum import (
-    PICARD_REF,
-    QC_SUM_HEADER,
-    SCRIPT_DIR,
-    merge_qcsum_files,
-    run_qcsum,
+SCRIPT_DIR = Path(__file__).parent.resolve()
+PANELS_YAML = SCRIPT_DIR / "config" / "panels.yaml"
+MULTIQC_CONFIG_YAML = SCRIPT_DIR / "config" / "multiqc_config.yaml"
+
+DEF_STEPS = ("demux", "align", "qc")
+
+QC_SUM_COLUMNS = (
+    "Sample",
+    "Tumor_Normal",
+    "Sequencing_Platform",
+    "Pipeline_version",
+    "Alignment_QC",
+    "Coverage_QC",
+    "Total_Reads",
+    "%Reads_Aligned",
+    "Capture",
+    "Avg_Capture_Coverage",
+    "%On/Near_Bait_Bases",
+    "%On_Bait_Bases",
+    "%On_Target_Bases",
+    "FOLD_80_BASE_PENALTY",
+    "AT_DROPOUT",
+    "GC_DROPOUT",
+    "Avg_ROI_Coverage",
+    "MEDIAN_ROI_COVERAGE",
+    "MAX_ROI_COVERAGE",
+    "%ROI_1x",
+    "%ROI_20x",
+    "%ROI_100x",
+    "%ROI_250x",
+    "%ROI_500x",
 )
+QC_SUM_HEADER = ",".join(QC_SUM_COLUMNS)
 
-# --- Configuration ---
-BAMS_DIR_DEFAULT = "/mnt/pns/bams/"
-FASTQS_DIR_DEFAULT = "/staging/hot/reads/"
-
-PANEL_CONFIG = {
-    "PCP": {
-        "BED": "/mnt/pns/tracks/ucla_mdl_cancer_ngs_v1_exon_targets.hg38.bed",
-        "HUMAN_REF": "/staging/human/reference/hg38_alt_masked_graph_v3",
-    },
-    "HEME": {
-        "BED": "/mnt/pns/tracks/goal_ucla_heme_221_exon_targets.hg38.bed",
-        "HUMAN_REF": "/staging/human/reference/hg38_alt_masked_graph_v3",
-    }
-}
-
-DEF_STEPS = [
-    "demux",
-    "align",
-    "qc",
-]
-
-SAMPLEINFO_PANEL_TO_QCSUM_PANEL = {
-    "Comprehensive Heme Panel": "heme_comp",
-    "MPN Screen Panel (JAK2, CALR, MPL)": "heme_mpn",
-    "JAK2": "heme_jak2",
-    "Peripheral Blood Lymphoma Panel": "heme_pblp",
-    "Tumor": "pcp_tumor",
-    "Normal": "pcp_normal",
-}
+logger = logging.getLogger(__name__)
 
 
-def parse_arguments(argv=None):
-    """
-    Parses command line arguments for the bcl-qc pipeline.
-    """
-    parser = argparse.ArgumentParser(description="BCL QC pipeline for NovaSeq runs.")
-    required_args = parser.add_argument_group('Required arguments')
-    required_args.add_argument("--run-dir", required=True, help="Directory containing the run data to be processed")
-    parser.add_argument("--fastqs-dir", help="Parent directory where FASTQs will be output", default=FASTQS_DIR_DEFAULT)
-    parser.add_argument("--bams-dir", help="Parent directory where BAMs will be output", default=BAMS_DIR_DEFAULT)
-    parser.add_argument("--sampleinfo", help="Path to the sampleinfo file for determining QC parameters.")
-    parser.add_argument("--steps", nargs='+', help="Run only the specified steps (demux, align, qc)", default=DEF_STEPS)
-    args = parser.parse_args(argv)
-    if "qc" in args.steps and not args.sampleinfo:
-        parser.error("--sampleinfo is required when running the 'qc' step")
-    return args
+class PanelsConfig:
+    """Declarative pipeline and QC configuration loaded from config/panels.yaml."""
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    def __init__(self, config_path: Path | str = PANELS_YAML):
+        self.config_path = Path(config_path)
+        with self.config_path.open() as f:
+            raw = yaml.safe_load(f)
+        if not isinstance(raw, dict) or not raw:
+            raise ValueError(f"Failed to load {self.config_path}: expected non-empty YAML mapping")
 
-def exec_command(cmd, executable=None, input_data=None):
-    """
-    Wrapper around subprocess.run, with enhanced error handling and logging.
+        self.defaults: dict[str, str] = {k: str(v) for k, v in (raw.get("defaults") or {}).items()}
+        self.align_groups: dict[str, dict] = dict(raw.get("align_groups") or {})
+        self._raw_qc_panels: dict[str, dict] = dict(raw.get("qc_panels") or {})
 
-    Args:
-        cmd (list): Command to execute as a list of strings.
-        executable (str, optional): Path to the executable if needed (e.g., 'sh' for shell scripts). Defaults to None.
-        input_data (bytes, optional): Input data to pipe to the command's stdin. Defaults to None.
+        self.qc_panels: dict[str, dict[str, str]] = {}
+        self.aliases: dict[str, str] = {}
+        for name in self._raw_qc_panels:
+            self.qc_panels[name] = self._resolve_qc_panel(name, stack=())
+            for alias in self._raw_qc_panels[name].get("aliases") or ():
+                self.aliases[str(alias)] = name
 
-    Returns:
-        subprocess.CompletedProcess: Result object from subprocess.run.
+    def _resolve_qc_panel(self, name: str, stack: tuple[str, ...]) -> dict[str, str]:
+        if name in stack:
+            cycle = " -> ".join([*stack, name])
+            raise ValueError(f"Circular panel inheritance in {self.config_path}: {cycle}")
+        if name not in self._raw_qc_panels:
+            available = ", ".join(self._raw_qc_panels)
+            raise ValueError(f"Panel '{name}' not found in {self.config_path}. Available: {available}")
 
-    Raises:
-        subprocess.CalledProcessError: If the command fails (non-zero exit code).
-    """
-    cmd_str = ' '.join(map(shlex.quote, cmd)) # Quote each argument for safety
-    logging.info(f"Running command: {cmd_str}")
+        entry = dict(self._raw_qc_panels[name] or {})
+        parent_name = entry.pop("inherits", None)
+        entry.pop("aliases", None)
+
+        merged: dict[str, object] = {}
+        if "platform" in self.defaults:
+            merged["platform"] = self.defaults["platform"]
+        if parent_name:
+            merged.update(self._resolve_qc_panel(str(parent_name), stack=(*stack, name)))
+        merged.update({k: v for k, v in entry.items() if v is not None})
+        return {k: str(v) for k, v in merged.items()}
+
+    def resolve_panel_name(self, panel_or_alias: str) -> str:
+        """Resolve a sampleinfo display name or canonical key to a configured QC panel."""
+        canonical = self.aliases.get(panel_or_alias, panel_or_alias)
+        if canonical not in self.qc_panels:
+            available = ", ".join(self.qc_panels)
+            raise ValueError(f"Unknown panel '{panel_or_alias}'. Available: {available}")
+        return canonical
+
+    def get_qc_panel(self, panel_or_alias: str) -> tuple[str, dict[str, str]]:
+        """Return (canonical_panel_name, resolved_settings)."""
+        name = self.resolve_panel_name(panel_or_alias)
+        return name, self.qc_panels[name]
+
+    def get_align_group(self, fastq_list: str | Path) -> tuple[str, dict]:
+        """Match a fastq_list.csv path to its align_groups entry by index directory name."""
+        parts = set(Path(fastq_list).parts)
+        for group_name, group_cfg in self.align_groups.items():
+            if group_name in parts:
+                return group_name, group_cfg
+        raise ValueError(f"Could not determine alignment group for fastq list: {fastq_list}")
+
+
+@dataclass(frozen=True)
+class QCSumSummary:
+    """Evaluated QC summary metrics and PASS/FAIL status for a single sample."""
+
+    sample_id: str
+    panel: str
+    sample_type: str
+    alignment_qc: str
+    coverage_qc: str
+    total_reads: int
+    pct_aligned: float
+    mean_target_coverage: float
+    covered_threshold: int
+    pct_roi_at_threshold: float
+    csv_line: str
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    """Atomically write text content to path via a temp file in the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        result = subprocess.run(
-            cmd,
-            check=True,
-            stdout=subprocess.PIPE,  # Capture stdout
-            stderr=subprocess.PIPE,  # Capture stderr
-            executable=executable,
-            input=input_data # Handle input data for piping
-        )
+        with os.fdopen(fd, "w") as tmp_file:
+            tmp_file.write(content)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def run_cmd(cmd: list[str], dry_run: bool = False) -> subprocess.CompletedProcess:
+    """Execute a subprocess command with shlex-quoted logging and clear error reporting."""
+    cmd_str = shlex.join(cmd)
+    logger.info("Running: %s", cmd_str)
+
+    if dry_run:
+        logger.info("[DRY RUN] Command not executed")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    try:
+        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.stderr:
-            logging.warning(f"stderr: {result.stderr.decode()}") # Log stderr as warning, not always an error
+            logger.warning("stderr: %s", result.stderr.decode(errors="replace"))
         return result
     except subprocess.CalledProcessError as e:
-        error_message = f"Command failed with return code: {e.returncode}\nCommand: {cmd_str}"
+        logger.error("Command failed (exit %s): %s", e.returncode, cmd_str)
         if e.stderr:
-            error_message += f"\nStderr: {e.stderr.decode()}" # Decode stderr for readability
-        logging.error(error_message) # Log full error message
-        raise # Re-raise the exception to stop pipeline execution
+            logger.error("stderr: %s", e.stderr.decode(errors="replace"))
+        raise
 
-def demux(run_dir, samplesheet, fastq_output):
-    """
-    Perform demultiplexing on a NovaSeq run using Dragen BCLConvert.
 
-    Args:
-        run_dir (str): Path to the folder containing the NovaSeq run data.
-        samplesheet (str): Path to the SampleSheet.csv to be used for this demultiplexing.
-        fastq_output (str): Path to the folder where the demultiplexed FASTQs will be written.
-    """
-    logging.info(f"Starting demultiplexing for run directory: {run_dir}, samplesheet: {samplesheet}, output to: {fastq_output}")
-    demux_cmd = [
-        "dragen",
-        "--bcl-conversion-only", "true",
-        "--bcl-use-hw", "false",
-        "--bcl-only-matched-reads", "true",
-        "--bcl-input-directory", run_dir,
-        "--sample-sheet", samplesheet,
-        "--output-directory", fastq_output
+def _parse_float(metrics: dict[str, str], key: str, default: float = 0.0) -> float:
+    raw = metrics.get(key)
+    if raw is None or raw in ("", "?"):
+        return default
+    val = float(raw)
+    return default if math.isnan(val) else val
+
+
+def parse_hs_metrics(hsm_file: str | Path) -> dict[str, str]:
+    """Parse Picard CollectHsMetrics output into a {column: value} mapping."""
+    with open(hsm_file) as f:
+        lines = f.readlines()
+
+    for i, line in enumerate(lines):
+        if line.startswith("BAIT_SET\t"):
+            if i + 1 >= len(lines) or not lines[i + 1].strip():
+                raise ValueError(f"Missing metrics data row in {hsm_file}")
+            headers = line.rstrip("\r\n").split("\t")
+            values = lines[i + 1].rstrip("\r\n").split("\t")
+            normalized = ["0" if x in ("?", "") else x for x in values]
+            return dict(zip(headers, normalized))
+
+    raise ValueError(f"Could not parse metrics from {hsm_file}")
+
+
+def evaluate_qcsum(
+    sample_id: str,
+    panel: str,
+    metrics: dict[str, str],
+    panel_cfg: dict[str, str],
+    sample_type: str | None = None,
+) -> QCSumSummary:
+    """Evaluate alignment/coverage QC PASS/FAIL status and format the CSV row."""
+    total_reads_float = _parse_float(metrics, "TOTAL_READS")
+    total_reads = int(total_reads_float)
+    mean_target_coverage = _parse_float(metrics, "MEAN_TARGET_COVERAGE")
+    pct_aligned = _parse_float(metrics, "PCT_PF_UQ_READS_ALIGNED") * 100
+
+    covered_threshold = int(panel_cfg.get("covered", "100"))
+    roi_col = f"PCT_TARGET_BASES_{covered_threshold}X"
+    if roi_col not in metrics:
+        raise ValueError(f"Configured coverage column '{roi_col}' not found in Picard HsMetrics")
+    pct_roi = _parse_float(metrics, roi_col) * 100
+
+    fail_min_align = float(panel_cfg.get("fail_min_align_pct", "0"))
+    fail_min_reads = float(panel_cfg.get("fail_min_reads", "0"))
+    alignment_qc = "FAIL" if (pct_aligned < fail_min_align or total_reads_float < fail_min_reads) else "PASS"
+
+    fail_min_roi = float(panel_cfg.get("fail_min_roi_pct", "0"))
+    fail_min_avgcov = float(panel_cfg.get("fail_min_avgcov", "0"))
+    coverage_qc = "FAIL" if (pct_roi < fail_min_roi or mean_target_coverage < fail_min_avgcov) else "PASS"
+
+    def get_pct(key: str) -> str:
+        return f"{_parse_float(metrics, key) * 100:.2f}"
+
+    # ON_BAIT_BASES / PF_BASES_ALIGNED (and matching ON_TARGET_BASES / PF_BASES_ALIGNED)
+    # excludes near-bait bases without penalizing PCR duplicates like PCT_USABLE_BASES_*.
+    pf_bases_aligned = _parse_float(metrics, "PF_BASES_ALIGNED")
+    pct_on_bait = (_parse_float(metrics, "ON_BAIT_BASES") / pf_bases_aligned * 100) if pf_bases_aligned else 0.0
+    pct_on_target = (_parse_float(metrics, "ON_TARGET_BASES") / pf_bases_aligned * 100) if pf_bases_aligned else 0.0
+
+    resolved_sample_type = panel_cfg.get("sample_type", "") if sample_type is None else sample_type
+
+    fields = [
+        sample_id,
+        resolved_sample_type,
+        panel_cfg.get("platform", "NovaSeq6000"),
+        panel_cfg.get("pipeline_version", "Unknown"),
+        alignment_qc,
+        coverage_qc,
+        str(metrics.get("TOTAL_READS", "0")),
+        f"{pct_aligned:.2f}",
+        panel_cfg.get("capture", "unknown"),
+        f"{_parse_float(metrics, 'MEAN_BAIT_COVERAGE'):.2f}",
+        get_pct("PCT_SELECTED_BASES"),
+        f"{pct_on_bait:.2f}",
+        f"{pct_on_target:.2f}",
+        f"{_parse_float(metrics, 'FOLD_80_BASE_PENALTY'):.2f}",
+        f"{_parse_float(metrics, 'AT_DROPOUT'):.2f}",
+        f"{_parse_float(metrics, 'GC_DROPOUT'):.2f}",
+        f"{mean_target_coverage:.2f}",
+        str(metrics.get("MEDIAN_TARGET_COVERAGE", "0")),
+        str(metrics.get("MAX_TARGET_COVERAGE", "0")),
+        get_pct("PCT_TARGET_BASES_1X"),
+        get_pct("PCT_TARGET_BASES_20X"),
+        get_pct("PCT_TARGET_BASES_100X"),
+        get_pct("PCT_TARGET_BASES_250X"),
+        get_pct("PCT_TARGET_BASES_500X"),
     ]
-    exec_command(demux_cmd)
-    logging.info(f"Demultiplexing completed for output: {fastq_output}")
+    assert len(fields) == len(QC_SUM_COLUMNS)
 
-def align(fastq_list, bam_output, sample_id, panel="PCP"):
-    """
-    Perform alignment and variant calling using Dragen.
+    return QCSumSummary(
+        sample_id=sample_id,
+        panel=panel,
+        sample_type=resolved_sample_type,
+        alignment_qc=alignment_qc,
+        coverage_qc=coverage_qc,
+        total_reads=total_reads,
+        pct_aligned=pct_aligned,
+        mean_target_coverage=mean_target_coverage,
+        covered_threshold=covered_threshold,
+        pct_roi_at_threshold=pct_roi,
+        csv_line=",".join(fields),
+    )
 
-    Args:
-        fastq_list (str): Path to the fastq list CSV file.
-        bam_output (str): Path to the output directory for BAM/CRAM files.
-        sample_id (str): Sample identifier.
-        panel (str, optional): Sequencing panel type ('PCP' or 'HEME'). Defaults to "PCP".
-    """
-    logging.info(f"Starting alignment for sample: {sample_id}, fastq list: {fastq_list}, output to: {bam_output}, panel: {panel}")
-    config = PANEL_CONFIG.get(panel)
-    bed_file = config.get("BED")
-    human_ref = config.get("HUMAN_REF")
-    os.makedirs(bam_output, exist_ok=True)
 
-    dragen_command = [
+def run_picard_hs_metrics(
+    cram_file: str | Path,
+    output_file: str | Path,
+    bait_intervals: str,
+    target_intervals: str,
+    reference: str,
+    dry_run: bool = False,
+) -> None:
+    """Run Picard CollectHsMetrics on a CRAM/BAM file."""
+    run_cmd(
+        [
+            "picard",
+            "CollectHsMetrics",
+            f"I={cram_file}",
+            f"O={output_file}",
+            f"R={reference}",
+            f"BAIT_INTERVALS={bait_intervals}",
+            f"TARGET_INTERVALS={target_intervals}",
+        ],
+        dry_run=dry_run,
+    )
+
+
+def run_qcsum(
+    cram_file: str | Path,
+    panel: str,
+    config: PanelsConfig,
+    sample_id: str | None = None,
+    output_dir: str | Path | None = None,
+    reference: str | None = None,
+    sample_type: str | None = None,
+    dry_run: bool = False,
+) -> tuple[Path, QCSumSummary | None]:
+    """Run Picard CollectHsMetrics (skipping if non-empty .hsm.txt exists) and write .qcsum.txt."""
+    cram_path = Path(cram_file).resolve()
+    sample_id = sample_id or cram_path.stem
+    out_dir = cram_path.parent if output_dir is None else Path(output_dir).resolve()
+    if not dry_run:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    panel_name, panel_cfg = config.get_qc_panel(panel)
+    bait_intervals = panel_cfg.get("bait_intervals")
+    target_intervals = panel_cfg.get("target_intervals")
+    if not bait_intervals or not target_intervals:
+        raise ValueError(f"Panel '{panel_name}' missing bait_intervals or target_intervals")
+
+    picard_ref = reference or config.defaults["picard_ref"]
+    hsm_file = out_dir / f"{sample_id}.hsm.txt"
+    qcsum_file = out_dir / f"{sample_id}.qcsum.txt"
+
+    if hsm_file.is_file() and hsm_file.stat().st_size > 0:
+        logger.info("Picard output exists, skipping: %s", hsm_file)
+    else:
+        if not cram_path.exists() and not dry_run:
+            raise FileNotFoundError(f"CRAM/BAM file not found: {cram_path}")
+        run_picard_hs_metrics(
+            cram_file=cram_path,
+            output_file=hsm_file,
+            bait_intervals=bait_intervals,
+            target_intervals=target_intervals,
+            reference=picard_ref,
+            dry_run=dry_run,
+        )
+
+    if dry_run:
+        logger.info("[DRY RUN] Skipping metrics parsing for %s", sample_id)
+        return qcsum_file, None
+
+    metrics = parse_hs_metrics(hsm_file)
+    summary = evaluate_qcsum(sample_id, panel_name, metrics, panel_cfg, sample_type=sample_type)
+    write_text_atomic(qcsum_file, f"{QC_SUM_HEADER}\n{summary.csv_line}\n")
+    logger.info(
+        "QC summary written: %s (Align=%s, Cov=%s, Mean=%.2fx, ROI@%dx=%.2f%%)",
+        qcsum_file,
+        summary.alignment_qc,
+        summary.coverage_qc,
+        summary.mean_target_coverage,
+        summary.covered_threshold,
+        summary.pct_roi_at_threshold,
+    )
+    return qcsum_file, summary
+
+
+def merge_qcsum_files(
+    qcsum_files: Iterable[str | Path],
+    output_dir: str | Path | None = None,
+    output_name: str = "merged_qcsum.csv",
+) -> Path:
+    """Merge per-sample .qcsum.txt files into one CSV, validating matching headers."""
+    file_list = [Path(p) for p in qcsum_files]
+    if not file_list:
+        raise ValueError("No qcsum files provided to merge")
+
+    out_dir = Path.cwd() if output_dir is None else Path(output_dir).resolve()
+    output_file = out_dir / output_name
+
+    header: str | None = None
+    data_lines: list[str] = []
+    files_merged = 0
+
+    for path in file_list:
+        if not path.exists():
+            logger.warning("Skipping missing file: %s", path)
+            continue
+        lines = path.read_text().splitlines()
+        if not lines:
+            logger.warning("Skipping empty file: %s", path)
+            continue
+
+        file_header = lines[0].strip()
+        if header is None:
+            header = file_header
+        elif file_header != header:
+            raise ValueError(f"Header mismatch in {path}: expected '{header}', got '{file_header}'")
+
+        files_merged += 1
+        data_lines.extend(line.strip() for line in lines[1:] if line.strip())
+
+    if header is None:
+        raise ValueError("No valid qcsum files found to merge")
+
+    write_text_atomic(output_file, header + "\n" + "".join(f"{line}\n" for line in data_lines))
+    logger.info("Merged %d samples from %d files into %s", len(data_lines), files_merged, output_file)
+    return output_file
+
+
+def format_summary_table(summaries: list[QCSumSummary]) -> str:
+    """Render a compact human-readable PASS/FAIL QC summary table."""
+    if not summaries:
+        return "No samples summarized."
+    headers = ("Sample", "Panel", "Type", "Align", "Cov", "Reads", "%Aln", "MeanCov", "%ROI")
+    rows = [
+        (
+            s.sample_id,
+            s.panel,
+            s.sample_type or "-",
+            s.alignment_qc,
+            s.coverage_qc,
+            f"{s.total_reads:,}",
+            f"{s.pct_aligned:.2f}%",
+            f"{s.mean_target_coverage:.1f}x",
+            f"{s.pct_roi_at_threshold:.2f}%@{s.covered_threshold}x",
+        )
+        for s in summaries
+    ]
+    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    sep = "  ".join("-" * w for w in widths)
+    return "\n".join([fmt.format(*headers), sep, *(fmt.format(*r) for r in rows)])
+
+
+# --- Pipeline steps ---
+
+
+def derive_run_name(run_dir: str | Path) -> str:
+    """Extract the run directory basename cleanly regardless of path depth or trailing slashes."""
+    name = os.path.basename(os.path.normpath(str(run_dir)))
+    if not name or name in (".", "..", os.sep):
+        raise ValueError(f"Could not derive run name from --run-dir: {run_dir!r}")
+    return name
+
+
+def get_samplesheets(run_dir: str | Path) -> list[Path]:
+    """Return sorted SampleSheet_*.csv paths from a sequencer run directory."""
+    run_path = Path(run_dir)
+    sheets = sorted(
+        p for p in run_path.iterdir()
+        if p.is_file() and p.name.startswith("SampleSheet_") and p.suffix == ".csv"
+    )
+    if not sheets:
+        raise FileNotFoundError(f"No SampleSheet_*.csv files found in {run_path}")
+    return sheets
+
+
+def get_index(samplesheet: str | Path) -> str:
+    """Extract the index group label from SampleSheet_<index>.csv."""
+    stem = Path(samplesheet).stem
+    return stem.removeprefix("SampleSheet_")
+
+
+def get_sample_ids(fastq_list: str | Path) -> list[str]:
+    """Return sorted unique RGSM sample IDs from a DRAGEN fastq_list.csv."""
+    with open(fastq_list, newline="") as f:
+        return sorted({row["RGSM"] for row in csv.DictReader(f) if row.get("RGSM")})
+
+
+def read_sampleinfo(sampleinfo: str | Path) -> list[dict[str, str]]:
+    """Read sampleinfo TSV rows into a list of dicts using stdlib csv."""
+    with open(sampleinfo, newline="") as f:
+        return list(csv.DictReader(f, delimiter="\t"))
+
+
+def demux_samples(run_dir: str | Path, fastqs_dir: str | Path, dry_run: bool = False) -> None:
+    """Run DRAGEN BCLConvert for each SampleSheet_*.csv in run_dir."""
+    fastqs_path = Path(fastqs_dir)
+    if fastqs_path.exists():
+        raise FileExistsError(f"Demux output directory already exists: {fastqs_path}")
+    if not dry_run:
+        fastqs_path.mkdir(parents=True, exist_ok=True)
+
+    for sheet in get_samplesheets(run_dir):
+        fastq_output = fastqs_path / get_index(sheet)
+        run_cmd(
+            [
+                "dragen",
+                "--bcl-conversion-only", "true",
+                "--bcl-use-hw", "false",
+                "--bcl-only-matched-reads", "true",
+                "--bcl-input-directory", str(run_dir),
+                "--sample-sheet", str(sheet),
+                "--output-directory", str(fastq_output),
+            ],
+            dry_run=dry_run,
+        )
+
+
+def build_dragen_align_cmd(
+    fastq_list: str | Path,
+    bam_output: str | Path,
+    sample_id: str,
+    group_cfg: dict,
+    dragen_tmp_dir: str,
+) -> list[str]:
+    """Build the DRAGEN alignment + variant calling command from an align_groups entry."""
+    bed_file = str(group_cfg["bed"])
+    cmd = [
         "dragen",
-        "--intermediate-results-dir", "/staging/tmp",
+        "--intermediate-results-dir", dragen_tmp_dir,
         "--enable-map-align", "true",
         "--enable-map-align-output", "true",
         "--output-format", "CRAM",
@@ -153,7 +527,7 @@ def align(fastq_list, bam_output, sample_id, panel="PCP"):
         "--enable-sort", "true",
         "--soft-read-trimmers", "polyg,quality",
         "--trim-min-quality", "2",
-        "--ref-dir", human_ref,
+        "--ref-dir", str(group_cfg["human_ref"]),
         "--qc-coverage-tag-1", "target_bed",
         "--qc-coverage-region-1", bed_file,
         "--qc-coverage-reports-1", "cov_report",
@@ -162,337 +536,391 @@ def align(fastq_list, bam_output, sample_id, panel="PCP"):
         "--vc-combine-phased-variants-distance", "6",
         "--vc-emit-ref-confidence", "GVCF",
         "--enable-hla", "true",
-        "--fastq-list", fastq_list,
+        "--fastq-list", str(fastq_list),
         "--fastq-list-sample-id", sample_id,
-        "--output-directory", bam_output,
+        "--output-directory", str(bam_output),
         "--output-file-prefix", sample_id,
     ]
+    for token in group_cfg.get("extra_dragen_args") or ():
+        cmd.append(str(token).format(bed=bed_file))
+    return cmd
 
-    if panel == "HEME":
-        dragen_command.extend([
-            "--umi-enable", "true",
-            "--umi-source", "qname",
-            "--umi-correction-scheme", "random",
-            "--umi-min-supporting-reads", "1",
-            "--umi-metrics-interval-file", bed_file,
-            "--vc-enable-umi-germline", "true",
-            "--vc-enable-high-sensitivity-mode", "true",
-        ])
-    else:
-        dragen_command.extend([
-            "--enable-duplicate-marking", "true",
-        ])
 
-    exec_command(dragen_command)
-    logging.info(f"Alignment completed for sample: {sample_id}, output: {bam_output}")
+def align_samples(
+    fastqs_dir: str | Path,
+    bams_dir: str | Path,
+    config: PanelsConfig,
+    dry_run: bool = False,
+) -> None:
+    """Align all non-skipped samples discovered under fastqs_dir."""
+    fastq_lists = sorted(Path(fastqs_dir).rglob("fastq_list.csv"))
+    dragen_tmp_dir = config.defaults.get("dragen_tmp_dir", "/staging/tmp")
 
-def multiqc(fastqs_dir, bams_dir):
-    """
-    Run MultiQC to aggregate QC reports.
-
-    Args:
-        fastqs_dir (str): Directory containing FASTQ files.
-        bams_dir (str): Directory containing BAM/CRAM files.
-    """
-    logging.info(f"Starting MultiQC report generation, FASTQ dir: {fastqs_dir}, BAM dir: {bams_dir}")
-    # Remove wgs coverage reports since they are irrelevant to targeted panels
-    for wgs_csv in glob.glob(os.path.join(bams_dir, "*", "*.wgs_*.csv")):
-        try:
-            os.remove(wgs_csv)
-            logging.info(f"Removed irrelevant WGS coverage report: {wgs_csv}")
-        except FileNotFoundError:
-            pass
-
-    multiqc_cmd = [
-        "multiqc",
-        "--force",
-        "--config", str(SCRIPT_DIR / "config" / "multiqc_config.yaml"),
-        "--outdir", bams_dir,
-        bams_dir,
-        fastqs_dir,
-    ]
-    exec_command(multiqc_cmd)
-    logging.info(f"MultiQC report generation completed in: {bams_dir}")
-
-def qcsum_command(bam_file, sample, sample_dir, panel):
-    """
-    Run Picard CollectHsMetrics and generate QC summary for a single sample.
-
-    Args:
-        bam_file (str): Path to the BAM/CRAM file.
-        sample (str): Sample identifier.
-        sample_dir (str): Directory for sample-specific outputs.
-        panel (str): Sequencing panel type, based on sampleinfo.
-    """
-    qcsum_panel = SAMPLEINFO_PANEL_TO_QCSUM_PANEL.get(panel, panel)
-    # PCP sampleinfo "Tumor" column holds "Tumor" or "Normal"; left blank for Heme
-    sample_type = panel if panel in ("Tumor", "Normal") else None
-    run_qcsum(
-        cram_file=bam_file,
-        panel=qcsum_panel,
-        sample_id=sample,
-        output_dir=sample_dir,
-        reference=PICARD_REF,
-        sample_type=sample_type,
-    )
-
-def qcsum(bams_dir, sampleinfo):
-    """
-    Run Picard CollectHsMetrics and aggregate per-sample QC summaries into qcsum_mqc.csv.
-
-    Args:
-        bams_dir (str): Directory containing BAM/CRAM files.
-        sampleinfo (str): Path to sampleinfo TSV file.
-    """
-    logging.info(f"Starting qcsum for BAM directory: {bams_dir}")
-    sampleinfo_df = pd.read_csv(sampleinfo, sep="\t")
-    qcsum_cmd_args = []
-    qcsum_files = []
-    for _, row in sampleinfo_df.iterrows():
-        sample_id = row['Samples']
-        panel = row.get('Panel', row.get('Tumor')) # "Panel" for Heme, "Tumor" for PCP
-        bam_path = row.get('BAM Path')  # Use 'BAM Path' column from sampleinfo
-        output_dir = os.path.join(bams_dir, sample_id)
-        if not os.path.exists(output_dir): # output qc metrics into this run's directory even if sample is from a different run
-            os.makedirs(output_dir, exist_ok=True)
-        qcsum_cmd_args.append((bam_path, sample_id, output_dir, panel))
-        qcsum_files.append(os.path.join(output_dir, f"{sample_id}.qcsum.txt"))
-    with Pool() as pool:
-        pool.starmap(qcsum_command, qcsum_cmd_args)
-    if qcsum_files:
-        merge_qcsum_files(qcsum_files, output_dir=bams_dir, output_name="qcsum_mqc.csv")
-    else:
-        with open(os.path.join(bams_dir, "qcsum_mqc.csv"), "w") as outfile:
-            outfile.write(QC_SUM_HEADER + "\n")
-    logging.info(f"qcsum execution completed for directory: {bams_dir}")
-
-def demux_samples(run_dir, fastqs_dir):
-    """
-    Execute the demultiplexing step.
-
-    Args:
-        run_dir (str): Path to the run directory.
-        fastqs_dir (str): Path to the FASTQ output directory.
-    """
-    logging.info("Starting demux step")
-    if os.path.exists(fastqs_dir):
-        error_msg = "Skipping demux as output directory already exists: " + fastqs_dir
-        logging.error(error_msg)
-        raise Exception(error_msg)
-    os.makedirs(fastqs_dir, exist_ok=True)
-    samplesheets = get_samplesheets(run_dir)
-    for samplesheet in samplesheets:
-        fastq_output = f"{fastqs_dir}/{get_index(samplesheet)}"
-        demux(run_dir, samplesheet, fastq_output)
-    logging.info("Demux step completed")
-
-def align_samples(fastqs_dir, bams_dir):
-    """
-    Execute the alignment step.
-
-    Args:
-        fastqs_dir (str): Path to the FASTQ directory.
-        bams_dir (str): Path to the BAM output directory.
-    """
-    logging.info("Starting align step")
-
-    fastq_lists = [os.path.join(root, file) for root, _, files in os.walk(fastqs_dir) for file in files if file == "fastq_list.csv"]
     for fastq_list in fastq_lists:
-        if "/U5N2_I10/" in fastq_list:
-            panel = "HEME"
-        elif "/I10/" in fastq_list:
-            panel = "PCP"
-        elif "/I8N2_N10/" in fastq_list:
-            logging.info(f"Skipping alignment for exome samples in: {fastq_list}") # Skip exome samples
+        group_name, group_cfg = config.get_align_group(fastq_list)
+        if group_cfg.get("skip"):
+            logger.info("Skipping alignment for group '%s': %s", group_name, fastq_list)
             continue
-        else:
-            error_msg = "Could not determine bed file for fastq list: " + fastq_list
-            logging.error(error_msg)
-            raise Exception(error_msg)
+
         for sample_id in get_sample_ids(fastq_list):
-            bam_output = os.path.join(bams_dir, sample_id)
-            if os.path.exists(bam_output):
-                logging.info(f"Skipping alignment for {sample_id} as output directory already exists: {bam_output}")
+            bam_output = Path(bams_dir) / sample_id
+            if bam_output.exists():
+                logger.info("Skipping alignment for %s (output dir exists): %s", sample_id, bam_output)
                 continue
-            align(fastq_list, bam_output, sample_id, panel)
-    logging.info("Align step completed")
+            if not dry_run:
+                bam_output.mkdir(parents=True, exist_ok=True)
+            cmd = build_dragen_align_cmd(fastq_list, bam_output, sample_id, group_cfg, dragen_tmp_dir)
+            run_cmd(cmd, dry_run=dry_run)
 
-def qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo):
-    """
-    Execute the QC step, including saving plots, running MultiQC and qcsum.
 
-    Args:
-        run_dir (str): Path to the run directory.
-        fastqs_dir (str): Path to the FASTQ directory.
-        bams_dir (str): Path to the BAM directory.
-        sampleinfo (str): Path to sampleinfo with which to determine which BED/ilists to use for qcsum
-    """
-    logging.info("Starting qc step")
-    save_occ_pf_plot(run_dir, bams_dir)
-    qcsum(bams_dir, sampleinfo)
-    multiqc(fastqs_dir, bams_dir)
-    logging.info("QC step completed")
+def save_occ_pf_plot(run_dir: str | Path, output_dir: str | Path) -> Path | None:
+    """Save % Occupied vs % Pass Filter scatter plot from Illumina InterOp metrics."""
+    import matplotlib.pyplot as plt
+    from interop import py_interop_run, py_interop_run_metrics, py_interop_table
+    from numpy import float32, zeros
 
-def get_index(file_name):
-    """
-    Extract the index from a samplesheet filename.
-
-    Args:
-        file_name (str): Samplesheet filename (e.g., "SampleSheet_I10.csv").
-
-    Returns:
-        str: The index string (e.g., "I10").
-    """
-    # Assumes samplesheet format is "SampleSheet_{index}.csv"
-    return file_name.split('/')[-1].replace("SampleSheet_", "").replace(".csv", "")
-
-def get_samplesheets(run_dir):
-    """
-    Get a list of samplesheet filenames in a directory.
-
-    Args:
-        run_dir (str): Path to the run directory.
-
-    Returns:
-        list: List of samplesheet filenames.
-
-    Raises:
-        Exception: If no samplesheets are found in the directory.
-    """
-    samplesheets = [os.path.join(run_dir, f) for f in os.listdir(run_dir) if "SampleSheet_" in f]
-    if not samplesheets:
-        error_msg = "Error: No samplesheets found in " + run_dir
-        logging.error(error_msg)
-        raise Exception(error_msg)
-    return samplesheets
-
-def get_sample_ids(fastq_list):
-    """
-    Extract sample IDs from a fastq list CSV file.
-
-    Args:
-        fastq_list (str): Path to the fastq_list.csv file.
-
-    Returns:
-        set: Set of unique sample IDs (RGSM column).
-    """
-    fastq_list_df = pd.read_csv(fastq_list)
-    return set(fastq_list_df['RGSM'])
-
-def parse_run_metrics(run_dir):
-    """
-    Parses Illumina Interop run metrics from a run directory.
-
-    Args:
-        run_dir (str): Path to the Illumina run directory.
-
-    Returns:
-        pd.DataFrame or None: DataFrame of interop imaging table if data is found, None otherwise.
-    """
-    logging.info(f"Parsing run metrics from: {run_dir}")
-    # Initialize interop objects
     run_metrics = py_interop_run_metrics.run_metrics()
     valid_to_load = py_interop_run.uchar_vector(py_interop_run.MetricCount, 0)
     valid_to_load[py_interop_run.ExtendedTile] = 1
     valid_to_load[py_interop_run.Tile] = 1
     valid_to_load[py_interop_run.Extraction] = 1
 
-    # Read from the run folder
     try:
-        run_metrics.read(run_dir, valid_to_load)
-    except Exception as e: # Catch broad exception for interop errors
-        logging.error(f"Error occurred trying to open {run_dir}: {e}")
+        run_metrics.read(str(run_dir), valid_to_load)
+    except Exception as e:
+        logger.warning("Unable to read InterOp files in %s (%s); skipping plot", run_dir, e)
         return None
 
-    # Set up data table
     columns = py_interop_table.imaging_column_vector()
     py_interop_table.create_imaging_table_columns(run_metrics, columns)
-    ncolumns = columns.size()
-    if ncolumns == 0:
-        logging.warning("No interop data found in run metrics.")
-        return None # no data
+    if columns.size() == 0:
+        logger.warning("No InterOp imaging data found in %s; skipping plot", run_dir)
+        return None
 
-    headers = []
-    for i in range(ncolumns):
-        column = columns[i]
-        if column.has_children():
-            headers.extend(
-                [f"{column.name()} ({subname})" for subname in column.subcolumns()])
+    headers: list[str] = []
+    for i in range(columns.size()):
+        col = columns[i]
+        if col.has_children():
+            headers.extend(f"{col.name()} ({sub})" for sub in col.subcolumns())
         else:
-            headers.append(column.name())
+            headers.append(col.name())
 
-    column_count = py_interop_table.count_table_columns(columns)
     row_offsets = py_interop_table.map_id_offset()
     py_interop_table.count_table_rows(run_metrics, row_offsets)
-    data = zeros((row_offsets.size(), column_count), dtype=float32)
+    data = zeros((row_offsets.size(), py_interop_table.count_table_columns(columns)), dtype=float32)
+    py_interop_table.populate_imaging_table_data(run_metrics, columns, row_offsets, data.ravel())
 
-    # Populate table
-    py_interop_table.populate_imaging_table_data(
-        run_metrics, columns, row_offsets, data.ravel()
+    x_idx = headers.index("% Occupied")
+    y_idx = headers.index("% Pass Filter")
+    lane_idx = headers.index("Lane")
+
+    lanes = sorted({int(v) for v in data[:, lane_idx]})
+    for lane in lanes:
+        mask = data[:, lane_idx] == lane
+        plt.scatter(data[mask, x_idx], data[mask, y_idx], label=str(lane), alpha=0.5, s=8)
+
+    plt.xlabel("% Occupied")
+    plt.ylabel("% Pass Filter")
+    plt.xlim([0, 100])
+    plt.ylim([50, 100])
+    plt.legend(title="Lane", bbox_to_anchor=[1.2, 0.9])
+    plt.tight_layout()
+
+    image_path = Path(output_dir) / "occ_pf_lane_mqc.jpg"
+    plt.savefig(image_path, dpi=300)
+    plt.close()
+    logger.info("Saved InterOp plot: %s", image_path)
+    return image_path
+
+
+def multiqc(fastqs_dir: str | Path, bams_dir: str | Path, dry_run: bool = False) -> None:
+    """Remove irrelevant WGS DRAGEN coverage CSVs and run MultiQC."""
+    for wgs_csv in sorted(glob.glob(os.path.join(str(bams_dir), "*", "*.wgs_*.csv"))):
+        if dry_run:
+            logger.info("[DRY RUN] Would remove %s", wgs_csv)
+            continue
+        try:
+            os.remove(wgs_csv)
+            logger.info("Removed irrelevant WGS coverage report: %s", wgs_csv)
+        except FileNotFoundError:
+            pass
+
+    run_cmd(
+        [
+            "multiqc",
+            "--force",
+            "--config", str(MULTIQC_CONFIG_YAML),
+            "--outdir", str(bams_dir),
+            str(bams_dir),
+            str(fastqs_dir),
+        ],
+        dry_run=dry_run,
     )
 
-    logging.info(f"Interop run metrics parsed successfully from: {run_dir}")
-    return pd.DataFrame(data, columns=headers)
 
-def save_occ_pf_plot(run_dir, output_dir):
-    """
-    Saves a % Occupied x % Pass Filter scatter plot to the output directory.
+def run_qcsum_for_sampleinfo(
+    bams_dir: str | Path,
+    sampleinfo: str | Path,
+    config: PanelsConfig,
+    workers: int | None = None,
+    reference: str | None = None,
+    dry_run: bool = False,
+) -> list[QCSumSummary]:
+    """Run Picard/QCSum across all samples in sampleinfo.tsv and write qcsum_mqc.csv."""
+    rows = read_sampleinfo(sampleinfo)
+    bams_path = Path(bams_dir)
+    if not rows:
+        if not dry_run:
+            write_text_atomic(bams_path / "qcsum_mqc.csv", QC_SUM_HEADER + "\n")
+        return []
 
-    Args:
-        run_dir (str): Path to the Illumina run directory.
-        output_dir (str): Path to the output directory to save the plot.
-    """
-    logging.info(f"Generating and saving Occupied vs Pass Filter plot for: {run_dir}, output to: {output_dir}")
-    df = parse_run_metrics(run_dir)
-    if df is None:
-        logging.warning("Unable to parse Interop files, skipping plot generation.")
-        return
+    tasks = []
+    for row in rows:
+        sample_id = row["Samples"]
+        panel = row.get("Panel") or row.get("Tumor") or ""
+        bam_path = row.get("BAM Path") or ""
+        sample_dir = bams_path / sample_id
+        tasks.append((bam_path, panel, sample_id, sample_dir))
 
-    x = "% Occupied"
-    y = "% Pass Filter"
-    views = ["Lane"] # can add "Tile" or "Cycle" for more views
-    for view in views:
-        sns.scatterplot(
-            data=df,
-            x=x,
-            y=y,
-            hue=view,
-            alpha=0.5,
-            s=8,
-        )
-        plt.xlim([0, 100])
-        plt.ylim([50, 100])
-        plt.legend(title=view, bbox_to_anchor=[1.2, 0.9])
-        plt.tight_layout()
+    max_workers = workers or min(len(tasks), os.cpu_count() or 1)
+    results: dict[int, tuple[Path, QCSumSummary | None]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_idx = {
+            pool.submit(
+                run_qcsum,
+                cram_file=bam_path,
+                panel=panel,
+                config=config,
+                sample_id=sample_id,
+                output_dir=sample_dir,
+                reference=reference,
+                dry_run=dry_run,
+            ): idx
+            for idx, (bam_path, panel, sample_id, sample_dir) in enumerate(tasks)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            results[idx] = future.result()
 
-        image_path = os.path.join(output_dir, f"occ_pf_{view.lower()}_mqc.jpg")
-        logging.info(f"Saving Occupied vs Pass Filter graph to: {image_path}")
-        plt.savefig(image_path, dpi=300)
-        plt.close()
-    logging.info(f"Occupied vs Pass Filter plot saved to: {output_dir}")
+    if dry_run:
+        return []
 
-def bclqc_run(argv=None):
-    """
-    Main function to execute the bcl-qc pipeline.
-    """
-    args = parse_arguments(argv)
-    steps = args.steps
-    run_dir = args.run_dir
-    sampleinfo = args.sampleinfo
-    run_name = os.path.basename(os.path.normpath(run_dir))
-    if not run_name or run_name in (".", "..", os.sep):
-        raise ValueError(f"Could not derive run name from --run-dir: {run_dir!r}")
-    fastqs_dir = os.path.join(args.fastqs_dir, run_name)
-    bams_dir = os.path.join(args.bams_dir, run_name)
+    ordered_files = [results[i][0] for i in range(len(tasks))]
+    summaries = [results[i][1] for i in range(len(tasks)) if results[i][1] is not None]
+    merge_qcsum_files(ordered_files, output_dir=bams_path, output_name="qcsum_mqc.csv")
+    return summaries
 
-    if "demux" in steps:
-        demux_samples(run_dir, fastqs_dir)
-    if "align" in steps:
-        align_samples(fastqs_dir, bams_dir)
-    if "qc" in steps:
-        qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo)
 
-    logging.info("BCL QC pipeline run completed.")
+def qc_samples(
+    run_dir: str | Path,
+    fastqs_dir: str | Path,
+    bams_dir: str | Path,
+    sampleinfo: str | Path,
+    config: PanelsConfig,
+    workers: int | None = None,
+    reference: str | None = None,
+    dry_run: bool = False,
+) -> list[QCSumSummary]:
+    """Execute the QC stage: InterOp plot, Picard/QCSum aggregation, and MultiQC."""
+    if not dry_run:
+        save_occ_pf_plot(run_dir, bams_dir)
+    summaries = run_qcsum_for_sampleinfo(
+        bams_dir, sampleinfo, config, workers=workers, reference=reference, dry_run=dry_run
+    )
+    multiqc(fastqs_dir, bams_dir, dry_run=dry_run)
+    return summaries
+
+
+# --- CLI ---
+
+
+def _check_batch_collisions(crams: list[str], output_dir: str | None) -> None:
+    seen: dict[Path, str] = {}
+    for cram in crams:
+        cram_path = Path(cram).resolve()
+        out_dir = Path(output_dir).resolve() if output_dir else cram_path.parent
+        target = out_dir / f"{cram_path.stem}.qcsum.txt"
+        if target in seen:
+            raise ValueError(f"Output collision for '{cram_path.stem}' ({target}): '{seen[target]}' and '{cram}'")
+        seen[target] = cram
+
+
+def build_parser(config: PanelsConfig) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="BCL-QC: demux, align, Picard QCSum, and MultiQC CLI.")
+    parser.add_argument("--config", default=str(PANELS_YAML), help="Path to panels.yaml")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+    default_fastqs = config.defaults.get("fastqs_dir", "/staging/hot/reads")
+    default_bams = config.defaults.get("bams_dir", "/mnt/pns/bams")
+    default_ref = config.defaults.get("picard_ref", "/mnt/pns/tracks/ref/hg38.fa")
+
+    def add_run_io(p: argparse.ArgumentParser, include_bams: bool = True) -> None:
+        p.add_argument("--run-dir", required=True, help="Sequencer run directory")
+        p.add_argument("--fastqs-dir", default=default_fastqs, help="Parent FASTQ output directory")
+        if include_bams:
+            p.add_argument("--bams-dir", default=default_bams, help="Parent BAM/CRAM output directory")
+        p.add_argument("-n", "--dry-run", action="store_true", help="Log commands without executing")
+
+    p_run = sub.add_parser("run", help="Run selected pipeline steps (demux, align, qc)")
+    add_run_io(p_run)
+    p_run.add_argument("--sampleinfo", help="Path to sampleinfo TSV (required when 'qc' is in --steps)")
+    p_run.add_argument("--steps", nargs="+", choices=DEF_STEPS, default=list(DEF_STEPS), help="Steps to execute")
+    p_run.add_argument("-t", "--workers", type=int, default=None, help="Max concurrent Picard workers")
+    p_run.add_argument("--picard-ref", default=default_ref, help="Reference FASTA for Picard")
+
+    p_demux = sub.add_parser("demux", help="Run DRAGEN BCLConvert demultiplexing")
+    add_run_io(p_demux, include_bams=False)
+
+    p_align = sub.add_parser("align", help="Run DRAGEN alignment and variant calling")
+    add_run_io(p_align)
+
+    p_qc = sub.add_parser("qc", help="Run InterOp plot, Picard QCSum, and MultiQC")
+    add_run_io(p_qc)
+    p_qc.add_argument("--sampleinfo", required=True, help="Path to sampleinfo TSV")
+    p_qc.add_argument("-t", "--workers", type=int, default=None, help="Max concurrent Picard workers")
+    p_qc.add_argument("--picard-ref", default=default_ref, help="Reference FASTA for Picard")
+
+    p_qcsum = sub.add_parser("qcsum", help="Run standalone Picard CollectHsMetrics + QCSum on 1+ CRAM/BAMs")
+    p_qcsum.add_argument("crams", nargs="+", metavar="CRAM", help="Input CRAM/BAM path(s)")
+    p_qcsum.add_argument("-p", "--panel", required=True, choices=list(config.qc_panels), help="QC panel")
+    p_qcsum.add_argument("-s", "--sample-id", help="Sample ID (only valid for a single CRAM)")
+    p_qcsum.add_argument("-o", "--output-dir", help="Output directory (defaults to each CRAM's parent)")
+    p_qcsum.add_argument("-r", "--picard-ref", default=default_ref, help="Reference FASTA for Picard")
+    p_qcsum.add_argument("-t", "--workers", type=int, default=None, help="Max parallel Picard jobs")
+    p_qcsum.add_argument("--merge-output", default="merged_qcsum.csv", help="Merged CSV filename for multi-CRAM runs")
+    p_qcsum.add_argument("-n", "--dry-run", action="store_true", help="Log commands without executing")
+
+    p_merge = sub.add_parser("merge", help="Merge multiple .qcsum.txt files into one CSV")
+    p_merge.add_argument("files", nargs="+", metavar="FILE", help="Input .qcsum.txt files")
+    p_merge.add_argument("-o", "--output-dir", help="Output directory (default: cwd)")
+    p_merge.add_argument("--output", default="merged_qcsum.csv", help="Merged output filename")
+
+    sub.add_parser("panels", help="List configured alignment groups and QC panels")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Pre-parse --config so subcommand choices reflect the selected panels.yaml
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=str(PANELS_YAML))
+    pre_args, _ = pre.parse_known_args(argv)
+    config = PanelsConfig(pre_args.config)
+
+    parser = build_parser(config)
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+    if getattr(args, "workers", None) is not None and args.workers < 1:
+        parser.error("--workers must be >= 1")
+
+    try:
+        if args.command == "panels":
+            print("Alignment groups:")
+            for name, grp in config.align_groups.items():
+                detail = "skipped" if grp.get("skip") else f"{grp['panel']} ({grp['human_ref']})"
+                print(f"  {name:12s} - {detail}")
+            print("\nQC panels:")
+            for name, pcfg in config.qc_panels.items():
+                print(
+                    f"  {name:12s} - {pcfg.get('pipeline_version', '')} "
+                    f"(cov>={pcfg.get('covered')}x, avg>={pcfg.get('fail_min_avgcov')}x)"
+                )
+            return 0
+
+        if args.command == "merge":
+            out = merge_qcsum_files(args.files, output_dir=args.output_dir, output_name=args.output)
+            print(f"Merged qcsum written to: {out}")
+            return 0
+
+        if args.command == "qcsum":
+            if args.sample_id and len(args.crams) > 1:
+                parser.error("--sample-id can only be used with a single CRAM")
+            if len(args.crams) > 1:
+                _check_batch_collisions(args.crams, args.output_dir)
+
+            max_workers = args.workers or min(len(args.crams), os.cpu_count() or 1)
+            results: dict[int, tuple[Path, QCSumSummary | None]] = {}
+            failed: list[str] = []
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futs = {
+                    pool.submit(
+                        run_qcsum,
+                        cram_file=cram,
+                        panel=args.panel,
+                        config=config,
+                        sample_id=args.sample_id,
+                        output_dir=args.output_dir,
+                        reference=args.picard_ref,
+                        dry_run=args.dry_run,
+                    ): (idx, cram)
+                    for idx, cram in enumerate(args.crams)
+                }
+                for fut in as_completed(futs):
+                    idx, cram = futs[fut]
+                    try:
+                        results[idx] = fut.result()
+                    except Exception as e:
+                        logger.error("Failed to process %s: %s", cram, e)
+                        failed.append(cram)
+
+            if args.dry_run:
+                return 0
+
+            ordered_indices = [i for i in range(len(args.crams)) if i in results]
+            summaries = [results[i][1] for i in ordered_indices if results[i][1] is not None]
+            if summaries:
+                print("\n" + format_summary_table(summaries))
+            if len(args.crams) > 1 and ordered_indices:
+                merged = merge_qcsum_files(
+                    [results[i][0] for i in ordered_indices],
+                    output_dir=args.output_dir,
+                    output_name=args.merge_output,
+                )
+                print(f"\nMerged qcsum: {merged}")
+            return 1 if failed else 0
+
+        run_name = derive_run_name(args.run_dir)
+        fastqs_dir = Path(args.fastqs_dir) / run_name
+        bams_dir = Path(getattr(args, "bams_dir", config.defaults["bams_dir"])) / run_name
+
+        if args.command == "demux":
+            demux_samples(args.run_dir, fastqs_dir, dry_run=args.dry_run)
+        elif args.command == "align":
+            align_samples(fastqs_dir, bams_dir, config, dry_run=args.dry_run)
+        elif args.command == "qc":
+            summaries = qc_samples(
+                args.run_dir, fastqs_dir, bams_dir, args.sampleinfo, config,
+                workers=args.workers, reference=args.picard_ref, dry_run=args.dry_run,
+            )
+            if summaries:
+                print("\n" + format_summary_table(summaries))
+        elif args.command == "run":
+            if "qc" in args.steps and not args.sampleinfo:
+                parser.error("--sampleinfo is required when 'qc' is in --steps")
+            if "demux" in args.steps:
+                demux_samples(args.run_dir, fastqs_dir, dry_run=args.dry_run)
+            if "align" in args.steps:
+                align_samples(fastqs_dir, bams_dir, config, dry_run=args.dry_run)
+            if "qc" in args.steps:
+                summaries = qc_samples(
+                    args.run_dir, fastqs_dir, bams_dir, args.sampleinfo, config,
+                    workers=args.workers, reference=args.picard_ref, dry_run=args.dry_run,
+                )
+                if summaries:
+                    print("\n" + format_summary_table(summaries))
+        return 0
+    except (FileNotFoundError, FileExistsError, ValueError) as e:
+        logger.error("%s", e)
+        return 1
+    except subprocess.CalledProcessError as e:
+        return e.returncode
+
 
 if __name__ == "__main__":
-    bclqc_run()
+    sys.exit(main())
