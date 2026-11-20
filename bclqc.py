@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import json
 import logging
 import math
 import os
@@ -573,17 +574,79 @@ def align_samples(
             run_cmd(cmd, dry_run=dry_run)
 
 
+LANE_COLORS = (
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+)
+
+
+def build_occ_pf_mqc_payload(headers: list[str], rows: Iterable[Iterable[float]]) -> dict | None:
+    """Build a MultiQC v1.23 custom-content scatter JSON payload for % Occupied vs % Pass Filter."""
+    x_idx = headers.index("% Occupied")
+    y_idx = headers.index("% Pass Filter")
+    lane_idx = headers.index("Lane")
+    tile_idx = headers.index("Tile") if "Tile" in headers else None
+
+    seen_tiles: set[tuple[int, int]] = set()
+    points: dict[str, dict[str, object]] = {}
+    for row_num, row in enumerate(rows):
+        vals = list(row)
+        occ = float(vals[x_idx])
+        pf = float(vals[y_idx])
+        if math.isnan(occ) or math.isnan(pf) or math.isinf(occ) or math.isinf(pf):
+            continue
+        lane = int(vals[lane_idx])
+        tile = int(vals[tile_idx]) if tile_idx is not None else row_num
+        if (lane, tile) in seen_tiles:
+            continue
+        seen_tiles.add((lane, tile))
+        color = LANE_COLORS[(lane - 1) % len(LANE_COLORS)]
+        points[f"Lane {lane} Tile {tile}"] = {
+            "x": round(occ, 3),
+            "y": round(pf, 3),
+            "color": color,
+            "opacity": 0.5,
+            "marker_size": 5,
+        }
+
+    if not points:
+        return None
+
+    return {
+        "id": "occ_pf_lane",
+        "section_name": "Occupied vs Pass Filter",
+        "description": "Illumina InterOp % Occupied vs % Pass Filter per tile, colored by lane.",
+        "plot_type": "scatter",
+        "pconfig": {
+            "id": "occ_pf_lane_plot",
+            "title": "% Occupied vs % Pass Filter",
+            "xlab": "% Occupied",
+            "ylab": "% Pass Filter",
+            "xmin": 0,
+            "xmax": 100,
+            "ymin": 50,
+            "ymax": 100,
+        },
+        "data": points,
+    }
+
+
 def save_occ_pf_plot(run_dir: str | Path, output_dir: str | Path) -> Path | None:
-    """Save % Occupied vs % Pass Filter scatter plot from Illumina InterOp metrics."""
-    import matplotlib.pyplot as plt
+    """Emit native MultiQC scatter JSON (occ_pf_lane_mqc.json) from Illumina InterOp metrics."""
     from interop import py_interop_run, py_interop_run_metrics, py_interop_table
     from numpy import float32, zeros
 
     run_metrics = py_interop_run_metrics.run_metrics()
     valid_to_load = py_interop_run.uchar_vector(py_interop_run.MetricCount, 0)
+    # Only Tile (% Pass Filter) and ExtendedTile (% Occupied) are needed; skip per-cycle Extraction
     valid_to_load[py_interop_run.ExtendedTile] = 1
     valid_to_load[py_interop_run.Tile] = 1
-    valid_to_load[py_interop_run.Extraction] = 1
 
     try:
         run_metrics.read(str(run_dir), valid_to_load)
@@ -610,27 +673,15 @@ def save_occ_pf_plot(run_dir: str | Path, output_dir: str | Path) -> Path | None
     data = zeros((row_offsets.size(), py_interop_table.count_table_columns(columns)), dtype=float32)
     py_interop_table.populate_imaging_table_data(run_metrics, columns, row_offsets, data.ravel())
 
-    x_idx = headers.index("% Occupied")
-    y_idx = headers.index("% Pass Filter")
-    lane_idx = headers.index("Lane")
+    payload = build_occ_pf_mqc_payload(headers, data)
+    if payload is None:
+        logger.warning("No valid InterOp points found in %s; skipping plot", run_dir)
+        return None
 
-    lanes = sorted({int(v) for v in data[:, lane_idx]})
-    for lane in lanes:
-        mask = data[:, lane_idx] == lane
-        plt.scatter(data[mask, x_idx], data[mask, y_idx], label=str(lane), alpha=0.5, s=8)
-
-    plt.xlabel("% Occupied")
-    plt.ylabel("% Pass Filter")
-    plt.xlim([0, 100])
-    plt.ylim([50, 100])
-    plt.legend(title="Lane", bbox_to_anchor=[1.2, 0.9])
-    plt.tight_layout()
-
-    image_path = Path(output_dir) / "occ_pf_lane_mqc.jpg"
-    plt.savefig(image_path, dpi=300)
-    plt.close()
-    logger.info("Saved InterOp plot: %s", image_path)
-    return image_path
+    json_path = Path(output_dir) / "occ_pf_lane_mqc.json"
+    write_text_atomic(json_path, json.dumps(payload, allow_nan=False) + "\n")
+    logger.info("Saved native MultiQC InterOp plot: %s (%d tiles)", json_path, len(payload["data"]))
+    return json_path
 
 
 def multiqc(fastqs_dir: str | Path, bams_dir: str | Path, dry_run: bool = False) -> None:

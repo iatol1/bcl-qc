@@ -160,6 +160,38 @@ class TestPanelsConfig(unittest.TestCase):
             mc = yaml.safe_load(f)
         self.assertNotIn("general_stats", mc["module_order"])
         self.assertEqual(mc["exclude_modules"], ["snippy"])
+        self.assertEqual(mc["custom_content"]["order"], ["qcsum-module", "occ_pf_lane"])
+
+    def test_conda_env_slimmed(self):
+        env_text = (bclqc.SCRIPT_DIR / "config" / "conda_env.yaml").read_text()
+        for dropped in ("r-base", "pandas", "seaborn", "matplotlib", "kaleido"):
+            self.assertNotIn(dropped, env_text)
+
+    def test_build_occ_pf_mqc_payload(self):
+        import json
+
+        headers = ["Lane", "Tile", "% Occupied", "% Pass Filter"]
+        rows = [
+            [1, 1101, 85.1234, 92.5678],
+            [1, 1101, 85.1234, 92.5678],  # duplicate tile across cycles -> deduplicated
+            [1, 1102, float("nan"), 90.0],  # NaN -> skipped
+            [2, 2101, 80.5, 88.25],
+        ]
+        payload = bclqc.build_occ_pf_mqc_payload(headers, rows)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["id"], "occ_pf_lane")
+        self.assertEqual(payload["plot_type"], "scatter")
+        self.assertEqual(payload["pconfig"]["ylab"], "% Pass Filter")
+        # MultiQC v1.23 custom_content requires dict values (not lists)
+        self.assertEqual(set(payload["data"].keys()), {"Lane 1 Tile 1101", "Lane 2 Tile 2101"})
+        for point in payload["data"].values():
+            self.assertIsInstance(point, dict)
+            self.assertIn("x", point)
+            self.assertIn("y", point)
+            self.assertIn("color", point)
+        # Strictly valid JSON (no NaN/Inf)
+        json.dumps(payload, allow_nan=False)
 
 
 class TestHsMetricsAndQCSum(unittest.TestCase):

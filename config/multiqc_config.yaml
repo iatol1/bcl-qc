@@ -9,7 +9,7 @@ module_order:
 custom_content:
   order:
     - qcsum-module
-    - occ_pf_lane-module
+    - occ_pf_lane
 
 exclude_modules:
   - snippy

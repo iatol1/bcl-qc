@@ -28,7 +28,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install test and lint dependencies
-        run: python -m pip install --upgrade pip pyyaml pandas ruff
+        run: python -m pip install --upgrade pip pyyaml ruff
 
       - name: Lint and syntax check
         run: |
