@@ -62,16 +62,24 @@ LOCAL_PICARD_REF = "/staging/human/reference/hg38/hg38.fa"
 
 
 def resolve_picard_ref(explicit_ref=None):
-    """Return explicit Picard FASTA, local NVMe FASTA if present, else NAS default."""
+    """Return explicit Picard FASTA, local NVMe FASTA if indexed (.fai + .dict), else NAS default."""
     if explicit_ref:
         return explicit_ref
-    if os.path.exists(LOCAL_PICARD_REF):
+    local_fai = f"{LOCAL_PICARD_REF}.fai"
+    local_stem_dict = f"{os.path.splitext(LOCAL_PICARD_REF)[0]}.dict"
+    local_full_dict = f"{LOCAL_PICARD_REF}.dict"
+    if (
+        os.path.isfile(LOCAL_PICARD_REF)
+        and os.path.getsize(LOCAL_PICARD_REF) > 0
+        and os.path.isfile(local_fai)
+        and (os.path.isfile(local_stem_dict) or os.path.isfile(local_full_dict))
+    ):
         return LOCAL_PICARD_REF
     return PICARD_REF
 
 
 def resolve_local_bam(bams_dir, sample_id, fallback_bam_path):
-    """Prefer a local NVMe CRAM/BAM in bams_dir (or _staged_normals) over CIFS BAM Path."""
+    """Prefer a non-empty local NVMe CRAM/BAM in bams_dir (or _staged_normals) over CIFS BAM Path."""
     candidates = [
         os.path.join(bams_dir, sample_id, f"{sample_id}.cram"),
         os.path.join(bams_dir, sample_id, f"{sample_id}.bam"),
@@ -79,20 +87,30 @@ def resolve_local_bam(bams_dir, sample_id, fallback_bam_path):
         os.path.join(bams_dir, "_staged_normals", sample_id, f"{sample_id}.bam"),
     ]
     for candidate in candidates:
-        if os.path.exists(candidate):
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
             return candidate
-    return fallback_bam_path
+    if fallback_bam_path is None or pd.isna(fallback_bam_path):
+        return None
+    fallback_str = str(fallback_bam_path).strip()
+    return fallback_str if fallback_str else None
 
 
 def has_enough_staging_space(path, min_gb):
     """Return True if the filesystem containing path has at least min_gb GB free."""
-    check_path = path
+    abs_path = os.path.abspath(path)
+    check_path = abs_path
     while not os.path.exists(check_path):
-        parent = os.path.dirname(check_path.rstrip("/"))
+        parent = os.path.dirname(check_path)
         if not parent or parent == check_path:
             return False
         check_path = parent
-    free_gb = shutil.disk_usage(check_path).free / (1024 ** 3)
+    # Do not silently fall back to measuring root '/' if a dedicated staging mount is missing
+    if check_path == os.path.sep and abs_path != os.path.sep:
+        return False
+    try:
+        free_gb = shutil.disk_usage(check_path).free / (1024 ** 3)
+    except OSError:
+        return False
     return free_gb >= min_gb
 
 
@@ -200,7 +218,7 @@ def demux(run_dir, samplesheet, fastq_output):
     exec_command(demux_cmd)
     logging.info(f"Demultiplexing completed for output: {fastq_output}")
 
-def align(fastq_list, bam_output, sample_id, panel="PCP"):
+def align(fastq_list, bam_output, sample_id, panel="PCP", force=False):
     """
     Perform alignment and variant calling using Dragen.
 
@@ -209,6 +227,7 @@ def align(fastq_list, bam_output, sample_id, panel="PCP"):
         bam_output (str): Path to the output directory for BAM/CRAM files.
         sample_id (str): Sample identifier.
         panel (str, optional): Sequencing panel type ('PCP' or 'HEME'). Defaults to "PCP".
+        force (bool, optional): Pass --force to overwrite an incomplete output directory on resume.
     """
     logging.info(f"Starting alignment for sample: {sample_id}, fastq list: {fastq_list}, output to: {bam_output}, panel: {panel}")
     config = PANEL_CONFIG.get(panel)
@@ -240,6 +259,8 @@ def align(fastq_list, bam_output, sample_id, panel="PCP"):
         "--output-directory", bam_output,
         "--output-file-prefix", sample_id,
     ]
+    if force:
+        dragen_command.append("--force")
 
     if panel == "HEME":
         dragen_command.extend([
@@ -306,7 +327,11 @@ def qcsum_command(bam_file, sample, sample_dir, panel, picard_xmx=PICARD_XMX_DEF
 
     picard_cmd = ["picard"]
     if picard_xmx:
-        picard_cmd.append(f"-Xmx{picard_xmx}")
+        xmx = str(picard_xmx).strip()
+        if xmx.startswith("-Xmx"):
+            xmx = xmx[4:]
+        if xmx:
+            picard_cmd.append(f"-Xmx{xmx}")
     picard_cmd.extend([
         "CollectHsMetrics",
         "I=" + bam_file,
@@ -359,10 +384,12 @@ def qcsum(bams_dir, sampleinfo, qc_workers=QC_WORKERS_DEFAULT, picard_xmx=PICARD
     qcsum_cmd_args = []
     qcsum_files = []
     for _, row in sampleinfo_df.iterrows():
-        sample_id = row['Samples']
+        sample_id = str(row['Samples'])
         panel = row.get('Panel', row.get('Tumor')) # "Panel" for Heme, "Tumor" for PCP
         fallback_bam_path = row.get('BAM Path')  # Canonical 'BAM Path' column from sampleinfo
         bam_path = resolve_local_bam(bams_dir, sample_id, fallback_bam_path)
+        if not bam_path:
+            raise ValueError(f"No BAM/CRAM path found for sample '{sample_id}' in {bams_dir} or sampleinfo")
         output_dir = os.path.join(bams_dir, sample_id)
         if not os.path.exists(output_dir): # output qc metrics into this run's directory even if sample is from a different run
             os.makedirs(output_dir, exist_ok=True)
@@ -433,10 +460,21 @@ def align_samples(fastqs_dir, bams_dir):
         for sample_id in sorted(get_sample_ids(fastq_list)):
             bam_output = os.path.join(bams_dir, sample_id)
             expected_cram = os.path.join(bam_output, f"{sample_id}.cram")
-            if os.path.exists(expected_cram):
-                logging.info(f"Skipping alignment for {sample_id} as output CRAM already exists: {expected_cram}")
+            expected_crai = expected_cram + ".crai"
+            if (
+                os.path.isfile(expected_cram)
+                and os.path.getsize(expected_cram) > 0
+                and os.path.isfile(expected_crai)
+                and os.path.getsize(expected_crai) > 0
+            ):
+                logging.info(f"Skipping alignment for {sample_id} as output CRAM+CRAI already exist: {expected_cram}")
                 continue
-            align(fastq_list, bam_output, sample_id, panel)
+            needs_force = os.path.isdir(bam_output) and any(os.scandir(bam_output))
+            if needs_force:
+                logging.warning(
+                    f"Incomplete alignment directory found for {sample_id} at {bam_output}; re-running DRAGEN with --force"
+                )
+            align(fastq_list, bam_output, sample_id, panel, force=needs_force)
     logging.info("Align step completed")
 
 def qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo, qc_workers=QC_WORKERS_DEFAULT, picard_xmx=PICARD_XMX_DEFAULT, picard_ref=None):
@@ -450,6 +488,7 @@ def qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo, qc_workers=QC_WORKERS_
         sampleinfo (str): Path to sampleinfo with which to determine which BED/ilists to use for qcsum
     """
     logging.info("Starting qc step")
+    os.makedirs(bams_dir, exist_ok=True)
     save_occ_pf_plot(run_dir, bams_dir)
     qcsum(bams_dir, sampleinfo, qc_workers=qc_workers, picard_xmx=picard_xmx, picard_ref=picard_ref)
     multiqc(fastqs_dir, bams_dir)
@@ -594,12 +633,17 @@ def save_occ_pf_plot(run_dir, output_dir):
     logging.info(f"Occupied vs Pass Filter plot saved to: {output_dir}")
 
 def sync_local_bams_to_nas(local_bams_dir, nas_bams_dir):
-    """Rsync local NVMe BAM/QC outputs back to the NAS destination."""
+    """Rsync local NVMe BAM/QC outputs back to the NAS destination using CIFS-safe flags."""
+    if not os.path.isdir(local_bams_dir):
+        logging.info(f"Local BAM directory does not exist ({local_bams_dir}); skipping NAS rsync.")
+        return
     os.makedirs(nas_bams_dir, exist_ok=True)
     exec_command([
-        "rsync", "-a",
+        "rsync", "-rlt",
+        "--no-perms", "--no-owner", "--no-group", "--omit-dir-times",
         "--exclude", "_staged_normals",
         "--exclude", "*.tmp",
+        "--exclude", ".*.done",
         local_bams_dir.rstrip("/") + "/",
         nas_bams_dir.rstrip("/") + "/",
     ])
@@ -613,7 +657,7 @@ def bclqc_run():
     steps = args.steps
     run_dir = args.run_dir
     sampleinfo = args.sampleinfo
-    run_name = os.path.basename(run_dir.rstrip('/'))
+    run_name = os.path.basename(os.path.normpath(run_dir))
     fastqs_dir = os.path.join(args.fastqs_dir, run_name)
     nas_bams_dir = os.path.join(args.bams_dir, run_name)
 
