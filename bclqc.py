@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 import argparse
 import pandas as pd
@@ -14,7 +15,11 @@ import yaml
 
 # --- Configuration ---
 BAMS_DIR_DEFAULT = "/mnt/pns/bams/"
+LOCAL_BAMS_DIR_DEFAULT = "/staging/hot/bams/"
 FASTQS_DIR_DEFAULT = "/staging/hot/reads/"
+STAGING_MIN_GB_DEFAULT = 300
+QC_WORKERS_DEFAULT = 4
+PICARD_XMX_DEFAULT = "4g"
 
 # Panel-specific config files
 QCSUM_CONFIG_YAML = "config/qcsum_config.yaml"
@@ -53,6 +58,43 @@ QC_SUM_HEADER = (
 )
 
 PICARD_REF = "/mnt/pns/tracks/ref/hg38.fa"
+LOCAL_PICARD_REF = "/staging/human/reference/hg38/hg38.fa"
+
+
+def resolve_picard_ref(explicit_ref=None):
+    """Return explicit Picard FASTA, local NVMe FASTA if present, else NAS default."""
+    if explicit_ref:
+        return explicit_ref
+    if os.path.exists(LOCAL_PICARD_REF):
+        return LOCAL_PICARD_REF
+    return PICARD_REF
+
+
+def resolve_local_bam(bams_dir, sample_id, fallback_bam_path):
+    """Prefer a local NVMe CRAM/BAM in bams_dir (or _staged_normals) over CIFS BAM Path."""
+    candidates = [
+        os.path.join(bams_dir, sample_id, f"{sample_id}.cram"),
+        os.path.join(bams_dir, sample_id, f"{sample_id}.bam"),
+        os.path.join(bams_dir, "_staged_normals", sample_id, f"{sample_id}.cram"),
+        os.path.join(bams_dir, "_staged_normals", sample_id, f"{sample_id}.bam"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return fallback_bam_path
+
+
+def has_enough_staging_space(path, min_gb):
+    """Return True if the filesystem containing path has at least min_gb GB free."""
+    check_path = path
+    while not os.path.exists(check_path):
+        parent = os.path.dirname(check_path.rstrip("/"))
+        if not parent or parent == check_path:
+            return False
+        check_path = parent
+    free_gb = shutil.disk_usage(check_path).free / (1024 ** 3)
+    return free_gb >= min_gb
+
 
 class QCSumInfo:
     def __init__(self, panel, sample_id):
@@ -87,6 +129,13 @@ def parse_arguments():
     required_args.add_argument("--run-dir", required=True, help="Directory containing the run data to be processed")
     parser.add_argument("--fastqs-dir", help="Parent directory where FASTQs will be output", default=FASTQS_DIR_DEFAULT)
     parser.add_argument("--bams-dir", help="Parent directory where BAMs will be output", default=BAMS_DIR_DEFAULT)
+    parser.add_argument("--local-bams-dir", help="Local NVMe parent directory for staging alignment/QC outputs", default=LOCAL_BAMS_DIR_DEFAULT)
+    parser.add_argument("--stage-local", action="store_true", help="Align/QC into --local-bams-dir when free space permits, then rsync to --bams-dir")
+    parser.add_argument("--no-sync", action="store_true", help="With --stage-local, leave rsync to the caller instead of syncing at exit")
+    parser.add_argument("--staging-min-gb", type=float, default=STAGING_MIN_GB_DEFAULT, help="Minimum free GB required to use --local-bams-dir")
+    parser.add_argument("--qc-workers", type=int, default=QC_WORKERS_DEFAULT, help="Max concurrent Picard/qcsum worker processes")
+    parser.add_argument("--picard-xmx", default=PICARD_XMX_DEFAULT, help="JVM max heap size passed to Picard (e.g. 4g); empty to omit")
+    parser.add_argument("--picard-ref", default=None, help="Reference FASTA for Picard CollectHsMetrics (defaults to local NVMe if present)")
     parser.add_argument("--sampleinfo", help="Path to the sampleinfo file for determining QC parameters.")
     parser.add_argument("--steps", nargs='+', help="Run only the specified steps (demux, align, qc)", default=DEF_STEPS)
     return parser.parse_args()
@@ -227,13 +276,14 @@ def multiqc(fastqs_dir, bams_dir):
         "--force",
         "--config", "config/multiqc_config.yaml", # Assuming config file exists at this path
         "--outdir", bams_dir,
+        "--ignore", "_staged_normals",
         bams_dir,
         fastqs_dir,
     ]
     exec_command(multiqc_cmd)
     logging.info(f"MultiQC report generation completed in: {bams_dir}")
 
-def qcsum_command(bam_file, sample, sample_dir, panel):
+def qcsum_command(bam_file, sample, sample_dir, panel, picard_xmx=PICARD_XMX_DEFAULT, picard_ref=None):
     """
     Run Picard CollectHsMetrics for QC summary.
 
@@ -242,6 +292,8 @@ def qcsum_command(bam_file, sample, sample_dir, panel):
         sample (str): Sample identifier.
         sample_dir (str): Directory for sample-specific outputs.
         panel (str): Sequencing panel type, based on sampleinfo.
+        picard_xmx (str): JVM max heap size (e.g. "4g"); empty string omits -Xmx.
+        picard_ref (str, optional): Reference FASTA path for Picard.
     """
     logging.info(f"Running Picard CollectHsMetrics for sample: {sample}, panel: {panel}")
     qcsum_info = QCSumInfo(panel, sample).config
@@ -249,20 +301,26 @@ def qcsum_command(bam_file, sample, sample_dir, panel):
     bait_intervals = qcsum_info.get("bait_intervals")
     target_intervals = qcsum_info.get("target_intervals")
     output_file = os.path.join(sample_dir, f"{sample}.hsm.txt")
+    tmp_output_file = output_file + ".tmp"
+    resolved_ref = resolve_picard_ref(picard_ref)
 
-    picard_cmd = [
-        "picard", "CollectHsMetrics",
+    picard_cmd = ["picard"]
+    if picard_xmx:
+        picard_cmd.append(f"-Xmx{picard_xmx}")
+    picard_cmd.extend([
+        "CollectHsMetrics",
         "I=" + bam_file,
-        "O=" + output_file,
-        "R=" + PICARD_REF,
+        "O=" + tmp_output_file,
+        "R=" + resolved_ref,
         "BAIT_INTERVALS=" + bait_intervals,
         "TARGET_INTERVALS=" + target_intervals
-    ]
+    ])
 
-    if os.path.exists(output_file):
+    if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
         logging.info(f"Skipping Picard CollectHsMetrics for {sample} as output file already exists: {output_file}")
     else:
         exec_command(picard_cmd)
+        os.replace(tmp_output_file, output_file)
         logging.info(f"Picard CollectHsMetrics completed for sample: {sample}, output: {output_file}")
 
     perl_cmd = [
@@ -289,35 +347,39 @@ def qcsum_command(bam_file, sample, sample_dir, panel):
     exec_command(perl_cmd)
     logging.info(f"qcsum_metrics.pl script executed for sample: {sample}, output: {output_file}")
 
-def qcsum(bams_dir, sampleinfo):
+def qcsum(bams_dir, sampleinfo, qc_workers=QC_WORKERS_DEFAULT, picard_xmx=PICARD_XMX_DEFAULT, picard_ref=None):
     """
     Run qcsum.sh script for QC summary.
 
     Args:
         bams_dir (str): Directory containing BAM/CRAM files.
     """
-    logging.info(f"Starting qcsum for BAM directory: {bams_dir}")
+    logging.info(f"Starting qcsum for BAM directory: {bams_dir} (workers={qc_workers}, picard_xmx={picard_xmx})")
     sampleinfo_df = pd.read_csv(sampleinfo, sep="\t")
     qcsum_cmd_args = []
     qcsum_files = []
     for _, row in sampleinfo_df.iterrows():
         sample_id = row['Samples']
         panel = row.get('Panel', row.get('Tumor')) # "Panel" for Heme, "Tumor" for PCP
-        bam_path = row.get('BAM Path')  # Use 'BAM Path' column from sampleinfo
+        fallback_bam_path = row.get('BAM Path')  # Canonical 'BAM Path' column from sampleinfo
+        bam_path = resolve_local_bam(bams_dir, sample_id, fallback_bam_path)
         output_dir = os.path.join(bams_dir, sample_id)
         if not os.path.exists(output_dir): # output qc metrics into this run's directory even if sample is from a different run
             os.makedirs(output_dir, exist_ok=True)
-        qcsum_cmd_args.append((bam_path, sample_id, output_dir, panel))
+        qcsum_cmd_args.append((bam_path, sample_id, output_dir, panel, picard_xmx, picard_ref))
         qcsum_files.append(os.path.join(output_dir, f"{sample_id}.qcsum.txt"))
-    with Pool() as pool:
+    worker_count = max(1, min(qc_workers, len(qcsum_cmd_args))) if qcsum_cmd_args else 1
+    with Pool(processes=worker_count) as pool:
         pool.starmap(qcsum_command, qcsum_cmd_args)
-    with open(f"{bams_dir}/qcsum_mqc.csv", "w") as outfile:
+    qcsum_csv_tmp = f"{bams_dir}/qcsum_mqc.csv.tmp"
+    with open(qcsum_csv_tmp, "w") as outfile:
         outfile.write(QC_SUM_HEADER + "\n")
         for qcsum_file in qcsum_files:
             with open(qcsum_file) as infile:
                 lines = infile.readlines()
                 outfile.writelines(lines[1:])  # Skip the first line (header) and write the QC info
         outfile.write("\n")
+    os.replace(qcsum_csv_tmp, f"{bams_dir}/qcsum_mqc.csv")
     logging.info(f"qcsum.sh execution completed for directory: {bams_dir}")
 
 def demux_samples(run_dir, fastqs_dir):
@@ -350,7 +412,12 @@ def align_samples(fastqs_dir, bams_dir):
     """
     logging.info("Starting align step")
 
-    fastq_lists = [os.path.join(root, file) for root, _, files in os.walk(fastqs_dir) for file in files if file == "fastq_list.csv"]
+    fastq_lists = sorted(
+        os.path.join(root, file)
+        for root, _, files in os.walk(fastqs_dir)
+        for file in files
+        if file == "fastq_list.csv"
+    )
     for fastq_list in fastq_lists:
         if "/U5N2_I10/" in fastq_list:
             panel = "HEME"
@@ -363,15 +430,16 @@ def align_samples(fastqs_dir, bams_dir):
             error_msg = "Could not determine bed file for fastq list: " + fastq_list
             logging.error(error_msg)
             raise Exception(error_msg)
-        for sample_id in get_sample_ids(fastq_list):
+        for sample_id in sorted(get_sample_ids(fastq_list)):
             bam_output = os.path.join(bams_dir, sample_id)
-            if os.path.exists(bam_output):
-                logging.info(f"Skipping alignment for {sample_id} as output directory already exists: {bam_output}")
+            expected_cram = os.path.join(bam_output, f"{sample_id}.cram")
+            if os.path.exists(expected_cram):
+                logging.info(f"Skipping alignment for {sample_id} as output CRAM already exists: {expected_cram}")
                 continue
             align(fastq_list, bam_output, sample_id, panel)
     logging.info("Align step completed")
 
-def qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo):
+def qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo, qc_workers=QC_WORKERS_DEFAULT, picard_xmx=PICARD_XMX_DEFAULT, picard_ref=None):
     """
     Execute the QC step, including saving plots, running MultiQC and qcsum.
 
@@ -383,7 +451,7 @@ def qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo):
     """
     logging.info("Starting qc step")
     save_occ_pf_plot(run_dir, bams_dir)
-    qcsum(bams_dir, sampleinfo)
+    qcsum(bams_dir, sampleinfo, qc_workers=qc_workers, picard_xmx=picard_xmx, picard_ref=picard_ref)
     multiqc(fastqs_dir, bams_dir)
     logging.info("QC step completed")
 
@@ -525,6 +593,18 @@ def save_occ_pf_plot(run_dir, output_dir):
         plt.close()
     logging.info(f"Occupied vs Pass Filter plot saved to: {output_dir}")
 
+def sync_local_bams_to_nas(local_bams_dir, nas_bams_dir):
+    """Rsync local NVMe BAM/QC outputs back to the NAS destination."""
+    os.makedirs(nas_bams_dir, exist_ok=True)
+    exec_command([
+        "rsync", "-a",
+        "--exclude", "_staged_normals",
+        "--exclude", "*.tmp",
+        local_bams_dir.rstrip("/") + "/",
+        nas_bams_dir.rstrip("/") + "/",
+    ])
+
+
 def bclqc_run():
     """
     Main function to execute the bcl-qc pipeline.
@@ -533,9 +613,24 @@ def bclqc_run():
     steps = args.steps
     run_dir = args.run_dir
     sampleinfo = args.sampleinfo
-    run_name = run_dir.split('/')[4]
-    fastqs_dir = args.fastqs_dir + '/' + run_name
-    bams_dir = args.bams_dir + '/' + run_name
+    run_name = os.path.basename(run_dir.rstrip('/'))
+    fastqs_dir = os.path.join(args.fastqs_dir, run_name)
+    nas_bams_dir = os.path.join(args.bams_dir, run_name)
+
+    use_local = False
+    if args.stage_local:
+        if has_enough_staging_space(args.local_bams_dir, args.staging_min_gb):
+            use_local = True
+            bams_dir = os.path.join(args.local_bams_dir, run_name)
+            logging.info(f"Using local NVMe BAM staging directory: {bams_dir}")
+        else:
+            logging.warning(
+                f"Insufficient free space (< {args.staging_min_gb} GB) in {args.local_bams_dir}; "
+                f"falling back to {nas_bams_dir}"
+            )
+            bams_dir = nas_bams_dir
+    else:
+        bams_dir = nas_bams_dir
 
     if "demux" in steps:
         demux_samples(run_dir, fastqs_dir)
@@ -544,7 +639,18 @@ def bclqc_run():
     if "qc" in steps:
         if not sampleinfo:
             logging.error("Sampleinfo file not found, cannot determine panel for QCSum.")
-        qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo)
+        qc_samples(
+            run_dir,
+            fastqs_dir,
+            bams_dir,
+            sampleinfo,
+            qc_workers=args.qc_workers,
+            picard_xmx=args.picard_xmx,
+            picard_ref=args.picard_ref,
+        )
+
+    if use_local and not args.no_sync and ("align" in steps or "qc" in steps):
+        sync_local_bams_to_nas(bams_dir, nas_bams_dir)
 
     logging.info("BCL QC pipeline run completed.")
 
