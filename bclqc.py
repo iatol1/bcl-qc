@@ -306,6 +306,8 @@ def qcsum(bams_dir, sampleinfo):
         panel = row.get('Panel', row.get('Tumor')) # "Panel" for Heme, "Tumor" for PCP
         bam_path = row.get('BAM Path')  # Use 'BAM Path' column from sampleinfo
         output_dir = os.path.join(bams_dir, sample_id)
+        if os.path.islink(output_dir):
+            raise ValueError(f"Refusing to write QC outputs through symlink directory: {output_dir}")
         if not os.path.exists(output_dir): # output qc metrics into this run's directory even if sample is from a different run
             os.makedirs(output_dir, exist_ok=True)
         qcsum_cmd_args.append((bam_path, sample_id, output_dir, panel))
@@ -352,6 +354,7 @@ def align_samples(fastqs_dir, bams_dir, samples=None):
     """
     logging.info("Starting align step")
     sample_filter = set(samples) if samples else None
+    matched_samples = 0
 
     fastq_lists = [os.path.join(root, file) for root, _, files in os.walk(fastqs_dir) for file in files if file == "fastq_list.csv"]
     for fastq_list in fastq_lists:
@@ -369,11 +372,14 @@ def align_samples(fastqs_dir, bams_dir, samples=None):
         for sample_id in sorted(get_sample_ids(fastq_list)):
             if sample_filter is not None and sample_id not in sample_filter:
                 continue
+            matched_samples += 1
             bam_output = os.path.join(bams_dir, sample_id)
             if os.path.exists(bam_output):
                 logging.info(f"Skipping alignment for {sample_id} as output directory already exists: {bam_output}")
                 continue
             align(fastq_list, bam_output, sample_id, panel)
+    if sample_filter is not None and matched_samples == 0:
+        raise ValueError(f"None of the requested samples {sorted(sample_filter)} were found in fastq_list.csv under {fastqs_dir}")
     logging.info("Align step completed")
 
 def qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo):
