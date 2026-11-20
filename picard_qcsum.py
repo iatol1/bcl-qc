@@ -29,17 +29,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
 import logging
 import math
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
-from typing import Iterable, Optional
+from collections.abc import Iterable
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+
 import yaml
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -246,7 +247,7 @@ def evaluate_qcsum(
     sample_id: str,
     metrics: dict[str, str],
     config: QCSumConfig,
-    sample_type: Optional[str] = None,
+    sample_type: str | None = None,
 ) -> QCSumSummary:
     """
     Evaluate alignment/coverage QC PASS/FAIL status and build a CSV line matching QC_SUM_HEADER.
@@ -343,7 +344,7 @@ def generate_qcsum_line(
     sample_id: str,
     metrics: dict[str, str],
     config: QCSumConfig,
-    sample_type: Optional[str] = None,
+    sample_type: str | None = None,
 ) -> str:
     """Generate a single CSV line for qcsum output matching QC_SUM_HEADER."""
     return evaluate_qcsum(sample_id, metrics, config, sample_type=sample_type).csv_line
@@ -357,11 +358,11 @@ def derive_sample_id(cram_file: str | Path) -> str:
 def run_qcsum(
     cram_file: str,
     panel: str,
-    sample_id: Optional[str] = None,
-    output_dir: Optional[str] = None,
+    sample_id: str | None = None,
+    output_dir: str | None = None,
     reference: str = PICARD_REF,
     dry_run: bool = False,
-    sample_type: Optional[str] = None,
+    sample_type: str | None = None,
     config_path: Path | str = QCSUM_CONFIG_YAML,
 ) -> dict:
     """
@@ -453,7 +454,7 @@ def run_qcsum(
 
 def merge_qcsum_files(
     qcsum_files: Iterable[str | Path],
-    output_dir: Optional[str | Path] = None,
+    output_dir: str | Path | None = None,
     output_name: str = "merged_qcsum.csv",
 ) -> str:
     """
@@ -476,7 +477,7 @@ def merge_qcsum_files(
     output_file = out_dir / output_name
 
     all_lines: list[str] = []
-    header: Optional[str] = None
+    header: str | None = None
     files_merged = 0
 
     for qcsum_file in qcsum_file_list:
@@ -527,13 +528,13 @@ def list_panels(config_path: Path | str = QCSUM_CONFIG_YAML) -> list[str]:
         if config and "pipeline_version" in config:
             print(f"  {panel:15s} - {config.get('pipeline_version', '')}")
             print(f"    Coverage threshold: {config.get('covered', 'N/A')}x")
-            print(f"    Min avg coverage: {config.get('pass_min_avgcov', 'N/A')}x")
+            print(f"    Min avg coverage: {config.get('fail_min_avgcov', 'N/A')}x")
         else:
             print(f"  {panel:15s} - (subpanel, inherits from heme_comp)")
     return list(yaml_obj.keys())
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     panel_choices = (
         QCSumConfig.available_panels() if QCSUM_CONFIG_YAML.exists() else None
@@ -591,7 +592,7 @@ Examples:
     return parser.parse_args(argv)
 
 
-def _check_batch_output_collisions(cram_files: list[str], output_dir: Optional[str]) -> None:
+def _check_batch_output_collisions(cram_files: list[str], output_dir: str | None) -> None:
     """Raise ValueError if two batch inputs would write to the same output qcsum file."""
     seen: dict[Path, str] = {}
     for cram_file in cram_files:
@@ -607,7 +608,7 @@ def _check_batch_output_collisions(cram_files: list[str], output_dir: Optional[s
         seen[target] = cram_file
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """Main entry point."""
     args = parse_args(argv)
 
