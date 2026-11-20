@@ -10,14 +10,17 @@ from numpy import zeros, float32
 import shlex  # For safely constructing shell commands
 import logging  # For more robust logging
 from multiprocessing import Pool
-import yaml
+from picard_qcsum import (
+    PICARD_REF,
+    QC_SUM_HEADER,
+    SCRIPT_DIR,
+    merge_qcsum_files,
+    run_qcsum,
+)
 
 # --- Configuration ---
 BAMS_DIR_DEFAULT = "/mnt/pns/bams/"
 FASTQS_DIR_DEFAULT = "/staging/hot/reads/"
-
-# Panel-specific config files
-QCSUM_CONFIG_YAML = "config/qcsum_config.yaml"
 
 PANEL_CONFIG = {
     "PCP": {
@@ -45,38 +48,6 @@ SAMPLEINFO_PANEL_TO_QCSUM_PANEL = {
     "Normal": "pcp_normal",
 }
 
-QC_SUM_HEADER = (
-    "Sample,Tumor_Normal,Sequencing_Platform,Pipeline_version,Alignment_QC,Coverage_QC,"
-    "Total_Reads,%Reads_Aligned,Capture,Avg_Capture_Coverage,%On/Near_Bait_Bases,"
-    "%On_Bait_Bases,FOLD_80_BASE_PENALTY,Avg_ROI_Coverage,MEDIAN_ROI_COVERAGE,"
-    "MAX_ROI_COVERAGE,%ROI_1x,%ROI_20x,%ROI_100x,%ROI_250x,%ROI_500x"
-)
-
-PICARD_REF = "/mnt/pns/tracks/ref/hg38.fa"
-
-class QCSumInfo:
-    def __init__(self, panel, sample_id):
-        self.panel = SAMPLEINFO_PANEL_TO_QCSUM_PANEL.get(panel, panel)
-        self.sample_id = sample_id
-        self.config = self.get_config()
-
-    def get_config(self):
-        with open(QCSUM_CONFIG_YAML) as f:
-            yaml_obj = yaml.safe_load(f)
-            if not yaml_obj:
-                raise ValueError(f"Failed to load {QCSUM_CONFIG_YAML}. Ensure it is a valid YAML file.")
-            if self.panel not in yaml_obj:
-                raise ValueError(f"Panel '{self.panel}' not found in {QCSUM_CONFIG_YAML}.")
-            if self.panel.startswith("heme_") and self.panel != "heme_comp":
-                yaml_dict = yaml_obj.get("heme_comp", {})
-                subpanel_dict = yaml_obj.get(self.panel, {})
-                # override target intervals using subpanel BED
-                target_intervals = subpanel_dict.get("target_intervals")
-                if target_intervals:
-                    yaml_dict["target_intervals"] = target_intervals
-            else:
-                yaml_dict = yaml_obj.get(self.panel, {})
-            return {k: str(v) for k, v in yaml_dict.items()}
 
 def parse_arguments():
     """
@@ -225,7 +196,7 @@ def multiqc(fastqs_dir, bams_dir):
     multiqc_cmd = [
         "multiqc",
         "--force",
-        "--config", "config/multiqc_config.yaml", # Assuming config file exists at this path
+        "--config", str(SCRIPT_DIR / "config" / "multiqc_config.yaml"),
         "--outdir", bams_dir,
         bams_dir,
         fastqs_dir,
@@ -235,7 +206,7 @@ def multiqc(fastqs_dir, bams_dir):
 
 def qcsum_command(bam_file, sample, sample_dir, panel):
     """
-    Run Picard CollectHsMetrics for QC summary.
+    Run Picard CollectHsMetrics and generate QC summary for a single sample.
 
     Args:
         bam_file (str): Path to the BAM/CRAM file.
@@ -243,58 +214,25 @@ def qcsum_command(bam_file, sample, sample_dir, panel):
         sample_dir (str): Directory for sample-specific outputs.
         panel (str): Sequencing panel type, based on sampleinfo.
     """
-    logging.info(f"Running Picard CollectHsMetrics for sample: {sample}, panel: {panel}")
-    qcsum_info = QCSumInfo(panel, sample).config
-
-    bait_intervals = qcsum_info.get("bait_intervals")
-    target_intervals = qcsum_info.get("target_intervals")
-    output_file = os.path.join(sample_dir, f"{sample}.hsm.txt")
-
-    picard_cmd = [
-        "picard", "CollectHsMetrics",
-        "I=" + bam_file,
-        "O=" + output_file,
-        "R=" + PICARD_REF,
-        "BAIT_INTERVALS=" + bait_intervals,
-        "TARGET_INTERVALS=" + target_intervals
-    ]
-
-    if os.path.exists(output_file):
-        logging.info(f"Skipping Picard CollectHsMetrics for {sample} as output file already exists: {output_file}")
-    else:
-        exec_command(picard_cmd)
-        logging.info(f"Picard CollectHsMetrics completed for sample: {sample}, output: {output_file}")
-
-    perl_cmd = [
-        "perl", "qcsum_metrics.pl",
-        "--prefix", sample,
-        "--qcfolder", sample_dir,
-        "--pipeline_version", qcsum_info.get("pipeline_version"),
-        "--platform", qcsum_info.get("platform"),
-        "--pass_min_align_pct", qcsum_info.get("pass_min_align_pct"),
-        "--fail_min_align_pct", qcsum_info.get("fail_min_align_pct"),
-        "--covered", qcsum_info.get("covered"),
-        "--pass_min_roi_pct", qcsum_info.get("pass_min_roi_pct"),
-        "--fail_min_roi_pct", qcsum_info.get("fail_min_roi_pct"),
-        "--pass_min_avgcov", qcsum_info.get("pass_min_avgcov"),
-        "--fail_min_avgcov", qcsum_info.get("fail_min_avgcov"),
-        "--pass_min_reads", qcsum_info.get("pass_min_reads"),
-        "--fail_min_reads", qcsum_info.get("fail_min_reads"),
-        "--capture", qcsum_info.get("capture"),
-        "--capture_version", qcsum_info.get("capture_version"),
-        # PCP sampleinfo "Tumor" column holds "Tumor" or "Normal"; left blank for Heme
-        "--sample_type", panel if panel in ("Tumor", "Normal") else "",
-    ]
-
-    exec_command(perl_cmd)
-    logging.info(f"qcsum_metrics.pl script executed for sample: {sample}, output: {output_file}")
+    qcsum_panel = SAMPLEINFO_PANEL_TO_QCSUM_PANEL.get(panel, panel)
+    # PCP sampleinfo "Tumor" column holds "Tumor" or "Normal"; left blank for Heme
+    sample_type = panel if panel in ("Tumor", "Normal") else None
+    run_qcsum(
+        cram_file=bam_file,
+        panel=qcsum_panel,
+        sample_id=sample,
+        output_dir=sample_dir,
+        reference=PICARD_REF,
+        sample_type=sample_type,
+    )
 
 def qcsum(bams_dir, sampleinfo):
     """
-    Run qcsum.sh script for QC summary.
+    Run Picard CollectHsMetrics and aggregate per-sample QC summaries into qcsum_mqc.csv.
 
     Args:
         bams_dir (str): Directory containing BAM/CRAM files.
+        sampleinfo (str): Path to sampleinfo TSV file.
     """
     logging.info(f"Starting qcsum for BAM directory: {bams_dir}")
     sampleinfo_df = pd.read_csv(sampleinfo, sep="\t")
@@ -311,14 +249,12 @@ def qcsum(bams_dir, sampleinfo):
         qcsum_files.append(os.path.join(output_dir, f"{sample_id}.qcsum.txt"))
     with Pool() as pool:
         pool.starmap(qcsum_command, qcsum_cmd_args)
-    with open(f"{bams_dir}/qcsum_mqc.csv", "w") as outfile:
-        outfile.write(QC_SUM_HEADER + "\n")
-        for qcsum_file in qcsum_files:
-            with open(qcsum_file) as infile:
-                lines = infile.readlines()
-                outfile.writelines(lines[1:])  # Skip the first line (header) and write the QC info
-        outfile.write("\n")
-    logging.info(f"qcsum.sh execution completed for directory: {bams_dir}")
+    if qcsum_files:
+        merge_qcsum_files(qcsum_files, output_dir=bams_dir, output_name="qcsum_mqc.csv")
+    else:
+        with open(os.path.join(bams_dir, "qcsum_mqc.csv"), "w") as outfile:
+            outfile.write(QC_SUM_HEADER + "\n")
+    logging.info(f"qcsum execution completed for directory: {bams_dir}")
 
 def demux_samples(run_dir, fastqs_dir):
     """
