@@ -397,6 +397,105 @@ class TestPipelineAndCLI(unittest.TestCase):
                 rows = list(csv.DictReader(f))
             self.assertEqual([(r["Sample"], r["Tumor_Normal"], r["Capture"]) for r in rows], [("H1", "", "goal")])
 
+    def test_picard_jvm_flags_bounded_workers_and_log_streaming(self):
+        self.assertEqual(bclqc.normalize_picard_xmx("4g"), "-Xmx4g")
+        self.assertEqual(bclqc.normalize_picard_xmx("-Xmx8G"), "-Xmx8G")
+        with self.assertRaises(ValueError):
+            bclqc.normalize_picard_xmx("0g")
+        with self.assertRaises(ValueError):
+            bclqc.normalize_picard_xmx("bad")
+
+        # Bounded default workers
+        with mock.patch("os.cpu_count", return_value=64):
+            self.assertEqual(bclqc.resolve_worker_count(20, None, self.cfg), 4)
+            self.assertEqual(bclqc.resolve_worker_count(2, None, self.cfg), 2)
+            self.assertEqual(bclqc.resolve_worker_count(20, 8, self.cfg), 8)
+
+        # Picard command includes -Xmx and -XX:ActiveProcessorCount=2 and log_file
+        captured = {}
+
+        def fake_run(cmd, dry_run=False, log_file=None):
+            captured["cmd"] = cmd
+            captured["log_file"] = log_file
+
+        with mock.patch.object(bclqc, "run_cmd", side_effect=fake_run):
+            bclqc.run_picard_hs_metrics(
+                "in.cram", "/tmp/out/S1.hsm.txt", "b.ilist", "t.ilist", "/nvme/hg38.fa",
+                picard_xmx="8g", log_file="/tmp/out/S1.picard.log",
+            )
+        self.assertEqual(captured["cmd"][:4], ["picard", "-Xmx8g", "-XX:ActiveProcessorCount=2", "CollectHsMetrics"])
+        self.assertIn("R=/nvme/hg38.fa", captured["cmd"])
+        self.assertEqual(captured["log_file"], "/tmp/out/S1.picard.log")
+
+        # Real subprocess streaming into log_file
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "sub.log"
+            bclqc.run_cmd(["python3", "-c", "print('hello'); import sys; print('err', file=sys.stderr)"], log_file=log)
+            text = log.read_text()
+            self.assertIn("hello", text)
+            self.assertIn("err", text)
+
+    def test_align_and_qc_overlapped_runs_qc_during_align_and_includes_historical(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            run_dir = tmp_path / "RUN_1"
+            run_dir.mkdir()
+            fastqs = tmp_path / "fastqs" / "RUN_1"
+            bams = tmp_path / "bams" / "RUN_1"
+            rep = fastqs / "I10" / "Reports"
+            rep.mkdir(parents=True)
+            (rep / "fastq_list.csv").write_text("RGSM,Read1File\nS1,r1.fq.gz\nS2,r2.fq.gz\n")
+
+            # Historical normal N_HIST is in sampleinfo but not in fastq_list.csv
+            si = tmp_path / "pcp_sampleinfo.tsv"
+            si.write_text(
+                "Samples\tTumor\tBAM Path\n"
+                f"S2\tTumor\t{bams}/S2/S2.cram\n"
+                f"N_HIST\tNormal\t{tmp_path}/old/N_HIST.cram\n"
+                f"S1\tTumor\t{bams}/S1/S1.cram\n"
+            )
+            (bams / "N_HIST").mkdir(parents=True)
+            (bams / "N_HIST" / "N_HIST.hsm.txt").write_text(make_hsm_text())
+
+            s1_qc_started = threading.Event()
+            events: list[str] = []
+
+            def fake_dragen(cmd, dry_run=False, log_file=None):
+                if cmd[0] == "dragen":
+                    sid = cmd[cmd.index("--fastq-list-sample-id") + 1]
+                    if sid == "S2":
+                        # Wait briefly to prove S1's QC already kicked off before S2 finishes aligning
+                        s1_qc_started.wait(timeout=2.0)
+                    events.append(f"align:{sid}")
+                    out_dir = Path(cmd[cmd.index("--output-directory") + 1])
+                    (out_dir / f"{sid}.hsm.txt").write_text(make_hsm_text())
+
+            real_run_qcsum = bclqc.run_qcsum
+
+            def tracked_qcsum(**kwargs):
+                if kwargs["sample_id"] == "S1":
+                    s1_qc_started.set()
+                events.append(f"qc:{kwargs['sample_id']}")
+                return real_run_qcsum(**kwargs)
+
+            with (
+                mock.patch.object(bclqc, "run_cmd", side_effect=fake_dragen),
+                mock.patch.object(bclqc, "run_qcsum", side_effect=tracked_qcsum),
+                mock.patch.object(bclqc, "save_occ_pf_plot", return_value=None),
+            ):
+                summaries = bclqc.align_and_qc_overlapped(run_dir, fastqs, bams, si, self.cfg, workers=2)
+
+            self.assertTrue(s1_qc_started.is_set(), "S1 QC should start before S2 alignment finishes")
+            self.assertEqual([s.sample_id for s in summaries], ["S2", "N_HIST", "S1"])
+            with (bams / "qcsum_mqc.csv").open() as f:
+                rows = list(csv.DictReader(f))
+            # Output CSV preserves exact sampleinfo order regardless of overlapped completion order
+            self.assertEqual([(r["Sample"], r["Tumor_Normal"]) for r in rows], [
+                ("S2", "Tumor"), ("N_HIST", "Normal"), ("S1", "Tumor"),
+            ])
+
 
 if __name__ == "__main__":
     unittest.main()

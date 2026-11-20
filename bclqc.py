@@ -22,12 +22,13 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -166,14 +167,55 @@ def write_text_atomic(path: Path, content: str) -> None:
         raise
 
 
-def run_cmd(cmd: list[str], dry_run: bool = False) -> subprocess.CompletedProcess:
-    """Execute a subprocess command with shlex-quoted logging and clear error reporting."""
+PICARD_XMX_RE = re.compile(r"^(-Xmx)?([1-9][0-9]*[kKmMgG])$")
+
+
+def normalize_picard_xmx(xmx: str) -> str:
+    """Validate and normalize a JVM heap flag such as '4g' or '-Xmx4g' into '-Xmx4g'."""
+    match = PICARD_XMX_RE.fullmatch(xmx.strip())
+    if not match:
+        raise ValueError(f"Invalid --picard-xmx value {xmx!r}; expected a JVM heap size like '4g' or '-Xmx8g'")
+    return f"-Xmx{match.group(2)}"
+
+
+def resolve_worker_count(num_tasks: int, requested: int | None, config: PanelsConfig) -> int:
+    """Return a bounded concurrent Picard worker count (default capped by panels.yaml qc_workers)."""
+    if requested is not None:
+        if requested < 1:
+            raise ValueError(f"--workers must be >= 1, got {requested}")
+        return max(1, min(num_tasks, requested))
+    default_cap = int(config.defaults.get("qc_workers", "4"))
+    return max(1, min(num_tasks, default_cap, os.cpu_count() or 1))
+
+
+def run_cmd(
+    cmd: list[str],
+    dry_run: bool = False,
+    log_file: Path | str | None = None,
+) -> subprocess.CompletedProcess:
+    """Execute a subprocess command, optionally streaming stdout/stderr directly to log_file."""
     cmd_str = shlex.join(cmd)
     logger.info("Running: %s", cmd_str)
 
     if dry_run:
         logger.info("[DRY RUN] Command not executed")
         return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    if log_file is not None:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with log_path.open("w") as lf:
+                return subprocess.run(cmd, check=True, stdout=lf, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            logger.error("Command failed (exit %s): %s (log: %s)", e.returncode, cmd_str, log_path)
+            try:
+                tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-20:])
+                if tail:
+                    logger.error("Last lines of %s:\n%s", log_path, tail)
+            except OSError:
+                pass
+            raise
 
     try:
         result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -299,12 +341,17 @@ def run_picard_hs_metrics(
     bait_intervals: str,
     target_intervals: str,
     reference: str,
+    picard_xmx: str = "4g",
+    log_file: Path | str | None = None,
     dry_run: bool = False,
 ) -> None:
-    """Run Picard CollectHsMetrics on a CRAM/BAM file."""
+    """Run Picard CollectHsMetrics with bounded JVM heap and GC thread count."""
+    xmx_flag = normalize_picard_xmx(picard_xmx)
     run_cmd(
         [
             "picard",
+            xmx_flag,
+            "-XX:ActiveProcessorCount=2",
             "CollectHsMetrics",
             f"I={cram_file}",
             f"O={output_file}",
@@ -313,6 +360,7 @@ def run_picard_hs_metrics(
             f"TARGET_INTERVALS={target_intervals}",
         ],
         dry_run=dry_run,
+        log_file=log_file,
     )
 
 
@@ -323,6 +371,7 @@ def run_qcsum(
     sample_id: str | None = None,
     output_dir: str | Path | None = None,
     reference: str | None = None,
+    picard_xmx: str | None = None,
     sample_type: str | None = None,
     dry_run: bool = False,
 ) -> tuple[Path, QCSumSummary | None]:
@@ -340,6 +389,7 @@ def run_qcsum(
         raise ValueError(f"Panel '{panel_name}' missing bait_intervals or target_intervals")
 
     picard_ref = reference or config.defaults["picard_ref"]
+    xmx = picard_xmx or config.defaults.get("picard_xmx", "4g")
     hsm_file = out_dir / f"{sample_id}.hsm.txt"
     qcsum_file = out_dir / f"{sample_id}.qcsum.txt"
 
@@ -354,6 +404,8 @@ def run_qcsum(
             bait_intervals=bait_intervals,
             target_intervals=target_intervals,
             reference=picard_ref,
+            picard_xmx=xmx,
+            log_file=out_dir / f"{sample_id}.picard.log",
             dry_run=dry_run,
         )
 
@@ -552,6 +604,7 @@ def align_samples(
     bams_dir: str | Path,
     config: PanelsConfig,
     dry_run: bool = False,
+    on_sample_aligned: Callable[[str], None] | None = None,
 ) -> None:
     """Align all non-skipped samples discovered under fastqs_dir."""
     fastq_lists = sorted(Path(fastqs_dir).rglob("fastq_list.csv"))
@@ -567,11 +620,13 @@ def align_samples(
             bam_output = Path(bams_dir) / sample_id
             if bam_output.exists():
                 logger.info("Skipping alignment for %s (output dir exists): %s", sample_id, bam_output)
-                continue
-            if not dry_run:
-                bam_output.mkdir(parents=True, exist_ok=True)
-            cmd = build_dragen_align_cmd(fastq_list, bam_output, sample_id, group_cfg, dragen_tmp_dir)
-            run_cmd(cmd, dry_run=dry_run)
+            else:
+                if not dry_run:
+                    bam_output.mkdir(parents=True, exist_ok=True)
+                cmd = build_dragen_align_cmd(fastq_list, bam_output, sample_id, group_cfg, dragen_tmp_dir)
+                run_cmd(cmd, dry_run=dry_run, log_file=bam_output / f"{sample_id}.dragen.log")
+            if on_sample_aligned is not None:
+                on_sample_aligned(sample_id)
 
 
 LANE_COLORS = (
@@ -709,31 +764,39 @@ def multiqc(fastqs_dir: str | Path, bams_dir: str | Path, dry_run: bool = False)
     )
 
 
+def _sampleinfo_qc_tasks(
+    bams_dir: Path, sampleinfo: str | Path
+) -> list[tuple[str, str, str, Path]]:
+    rows = read_sampleinfo(sampleinfo)
+    return [
+        (
+            row.get("BAM Path") or "",
+            row.get("Panel") or row.get("Tumor") or "",
+            row["Samples"],
+            bams_dir / row["Samples"],
+        )
+        for row in rows
+    ]
+
+
 def run_qcsum_for_sampleinfo(
     bams_dir: str | Path,
     sampleinfo: str | Path,
     config: PanelsConfig,
     workers: int | None = None,
     reference: str | None = None,
+    picard_xmx: str | None = None,
     dry_run: bool = False,
 ) -> list[QCSumSummary]:
     """Run Picard/QCSum across all samples in sampleinfo.tsv and write qcsum_mqc.csv."""
-    rows = read_sampleinfo(sampleinfo)
     bams_path = Path(bams_dir)
-    if not rows:
+    tasks = _sampleinfo_qc_tasks(bams_path, sampleinfo)
+    if not tasks:
         if not dry_run:
             write_text_atomic(bams_path / "qcsum_mqc.csv", QC_SUM_HEADER + "\n")
         return []
 
-    tasks = []
-    for row in rows:
-        sample_id = row["Samples"]
-        panel = row.get("Panel") or row.get("Tumor") or ""
-        bam_path = row.get("BAM Path") or ""
-        sample_dir = bams_path / sample_id
-        tasks.append((bam_path, panel, sample_id, sample_dir))
-
-    max_workers = workers or min(len(tasks), os.cpu_count() or 1)
+    max_workers = resolve_worker_count(len(tasks), workers, config)
     results: dict[int, tuple[Path, QCSumSummary | None]] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         future_to_idx = {
@@ -745,6 +808,7 @@ def run_qcsum_for_sampleinfo(
                 sample_id=sample_id,
                 output_dir=sample_dir,
                 reference=reference,
+                picard_xmx=picard_xmx,
                 dry_run=dry_run,
             ): idx
             for idx, (bam_path, panel, sample_id, sample_dir) in enumerate(tasks)
@@ -770,16 +834,99 @@ def qc_samples(
     config: PanelsConfig,
     workers: int | None = None,
     reference: str | None = None,
+    picard_xmx: str | None = None,
     dry_run: bool = False,
 ) -> list[QCSumSummary]:
     """Execute the QC stage: InterOp plot, Picard/QCSum aggregation, and MultiQC."""
     if not dry_run:
         save_occ_pf_plot(run_dir, bams_dir)
     summaries = run_qcsum_for_sampleinfo(
-        bams_dir, sampleinfo, config, workers=workers, reference=reference, dry_run=dry_run
+        bams_dir,
+        sampleinfo,
+        config,
+        workers=workers,
+        reference=reference,
+        picard_xmx=picard_xmx,
+        dry_run=dry_run,
     )
     multiqc(fastqs_dir, bams_dir, dry_run=dry_run)
     return summaries
+
+
+def align_and_qc_overlapped(
+    run_dir: str | Path,
+    fastqs_dir: str | Path,
+    bams_dir: str | Path,
+    sampleinfo: str | Path,
+    config: PanelsConfig,
+    workers: int | None = None,
+    reference: str | None = None,
+    picard_xmx: str | None = None,
+    dry_run: bool = False,
+) -> list[QCSumSummary]:
+    """Overlap CPU-bound Picard/QCSum jobs with FPGA DRAGEN alignments as each sample finishes."""
+    bams_path = Path(bams_dir)
+    tasks = _sampleinfo_qc_tasks(bams_path, sampleinfo)
+    if not tasks:
+        align_samples(fastqs_dir, bams_path, config, dry_run=dry_run)
+        if not dry_run:
+            save_occ_pf_plot(run_dir, bams_path)
+            write_text_atomic(bams_path / "qcsum_mqc.csv", QC_SUM_HEADER + "\n")
+        multiqc(fastqs_dir, bams_path, dry_run=dry_run)
+        return []
+
+    sample_to_indices: dict[str, list[int]] = {}
+    for idx, (_, _, sample_id, _) in enumerate(tasks):
+        sample_to_indices.setdefault(sample_id, []).append(idx)
+
+    max_workers = resolve_worker_count(len(tasks), workers, config)
+    submitted: dict[int, Future[tuple[Path, QCSumSummary | None]]] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        def submit_idx(idx: int) -> None:
+            if idx in submitted:
+                return
+            bam_path, panel, sample_id, sample_dir = tasks[idx]
+            submitted[idx] = pool.submit(
+                run_qcsum,
+                cram_file=bam_path,
+                panel=panel,
+                config=config,
+                sample_id=sample_id,
+                output_dir=sample_dir,
+                reference=reference,
+                picard_xmx=picard_xmx,
+                dry_run=dry_run,
+            )
+
+        def on_aligned(sample_id: str) -> None:
+            for idx in sample_to_indices.get(sample_id, ()):
+                submit_idx(idx)
+
+        try:
+            align_samples(fastqs_dir, bams_path, config, dry_run=dry_run, on_sample_aligned=on_aligned)
+        except Exception:
+            for fut in submitted.values():
+                fut.cancel()
+            raise
+
+        # Submit any remaining sampleinfo entries (e.g. historical normals from earlier runs)
+        for idx in range(len(tasks)):
+            submit_idx(idx)
+
+        if not dry_run:
+            save_occ_pf_plot(run_dir, bams_path)
+
+        results = {idx: fut.result() for idx, fut in submitted.items()}
+
+    if not dry_run:
+        ordered_files = [results[i][0] for i in range(len(tasks))]
+        merge_qcsum_files(ordered_files, output_dir=bams_path, output_name="qcsum_mqc.csv")
+
+    multiqc(fastqs_dir, bams_path, dry_run=dry_run)
+    if dry_run:
+        return []
+    return [results[i][1] for i in range(len(tasks)) if results[i][1] is not None]
 
 
 # --- CLI ---
@@ -805,6 +952,8 @@ def build_parser(config: PanelsConfig) -> argparse.ArgumentParser:
     default_fastqs = config.defaults.get("fastqs_dir", "/staging/hot/reads")
     default_bams = config.defaults.get("bams_dir", "/mnt/pns/bams")
     default_ref = config.defaults.get("picard_ref", "/mnt/pns/tracks/ref/hg38.fa")
+    default_xmx = config.defaults.get("picard_xmx", "4g")
+    default_workers = config.defaults.get("qc_workers", "4")
 
     def add_run_io(p: argparse.ArgumentParser, include_bams: bool = True) -> None:
         p.add_argument("--run-dir", required=True, help="Sequencer run directory")
@@ -813,12 +962,20 @@ def build_parser(config: PanelsConfig) -> argparse.ArgumentParser:
             p.add_argument("--bams-dir", default=default_bams, help="Parent BAM/CRAM output directory")
         p.add_argument("-n", "--dry-run", action="store_true", help="Log commands without executing")
 
+    def add_picard_opts(p: argparse.ArgumentParser, short_ref: bool = False) -> None:
+        p.add_argument(
+            "-t", "--workers", type=int, default=None,
+            help=f"Max concurrent Picard workers (default: min(tasks, {default_workers}))",
+        )
+        ref_flags = ("-r", "--picard-ref") if short_ref else ("--picard-ref",)
+        p.add_argument(*ref_flags, default=default_ref, help="Reference FASTA for Picard")
+        p.add_argument("--picard-xmx", default=default_xmx, help=f"JVM heap size for Picard (default: {default_xmx})")
+
     p_run = sub.add_parser("run", help="Run selected pipeline steps (demux, align, qc)")
     add_run_io(p_run)
     p_run.add_argument("--sampleinfo", help="Path to sampleinfo TSV (required when 'qc' is in --steps)")
     p_run.add_argument("--steps", nargs="+", choices=DEF_STEPS, default=list(DEF_STEPS), help="Steps to execute")
-    p_run.add_argument("-t", "--workers", type=int, default=None, help="Max concurrent Picard workers")
-    p_run.add_argument("--picard-ref", default=default_ref, help="Reference FASTA for Picard")
+    add_picard_opts(p_run)
 
     p_demux = sub.add_parser("demux", help="Run DRAGEN BCLConvert demultiplexing")
     add_run_io(p_demux, include_bams=False)
@@ -829,16 +986,14 @@ def build_parser(config: PanelsConfig) -> argparse.ArgumentParser:
     p_qc = sub.add_parser("qc", help="Run InterOp plot, Picard QCSum, and MultiQC")
     add_run_io(p_qc)
     p_qc.add_argument("--sampleinfo", required=True, help="Path to sampleinfo TSV")
-    p_qc.add_argument("-t", "--workers", type=int, default=None, help="Max concurrent Picard workers")
-    p_qc.add_argument("--picard-ref", default=default_ref, help="Reference FASTA for Picard")
+    add_picard_opts(p_qc)
 
     p_qcsum = sub.add_parser("qcsum", help="Run standalone Picard CollectHsMetrics + QCSum on 1+ CRAM/BAMs")
     p_qcsum.add_argument("crams", nargs="+", metavar="CRAM", help="Input CRAM/BAM path(s)")
     p_qcsum.add_argument("-p", "--panel", required=True, choices=list(config.qc_panels), help="QC panel")
     p_qcsum.add_argument("-s", "--sample-id", help="Sample ID (only valid for a single CRAM)")
     p_qcsum.add_argument("-o", "--output-dir", help="Output directory (defaults to each CRAM's parent)")
-    p_qcsum.add_argument("-r", "--picard-ref", default=default_ref, help="Reference FASTA for Picard")
-    p_qcsum.add_argument("-t", "--workers", type=int, default=None, help="Max parallel Picard jobs")
+    add_picard_opts(p_qcsum, short_ref=True)
     p_qcsum.add_argument("--merge-output", default="merged_qcsum.csv", help="Merged CSV filename for multi-CRAM runs")
     p_qcsum.add_argument("-n", "--dry-run", action="store_true", help="Log commands without executing")
 
@@ -868,6 +1023,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if getattr(args, "workers", None) is not None and args.workers < 1:
         parser.error("--workers must be >= 1")
+    if getattr(args, "picard_xmx", None) is not None:
+        try:
+            normalize_picard_xmx(args.picard_xmx)
+        except ValueError as e:
+            parser.error(str(e))
 
     try:
         if args.command == "panels":
@@ -894,7 +1054,7 @@ def main(argv: list[str] | None = None) -> int:
             if len(args.crams) > 1:
                 _check_batch_collisions(args.crams, args.output_dir)
 
-            max_workers = args.workers or min(len(args.crams), os.cpu_count() or 1)
+            max_workers = resolve_worker_count(len(args.crams), args.workers, config)
             results: dict[int, tuple[Path, QCSumSummary | None]] = {}
             failed: list[str] = []
 
@@ -908,6 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
                         sample_id=args.sample_id,
                         output_dir=args.output_dir,
                         reference=args.picard_ref,
+                        picard_xmx=args.picard_xmx,
                         dry_run=args.dry_run,
                     ): (idx, cram)
                     for idx, cram in enumerate(args.crams)
@@ -947,7 +1108,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "qc":
             summaries = qc_samples(
                 args.run_dir, fastqs_dir, bams_dir, args.sampleinfo, config,
-                workers=args.workers, reference=args.picard_ref, dry_run=args.dry_run,
+                workers=args.workers, reference=args.picard_ref,
+                picard_xmx=args.picard_xmx, dry_run=args.dry_run,
             )
             if summaries:
                 print("\n" + format_summary_table(summaries))
@@ -956,12 +1118,21 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("--sampleinfo is required when 'qc' is in --steps")
             if "demux" in args.steps:
                 demux_samples(args.run_dir, fastqs_dir, dry_run=args.dry_run)
-            if "align" in args.steps:
+            if "align" in args.steps and "qc" in args.steps:
+                summaries = align_and_qc_overlapped(
+                    args.run_dir, fastqs_dir, bams_dir, args.sampleinfo, config,
+                    workers=args.workers, reference=args.picard_ref,
+                    picard_xmx=args.picard_xmx, dry_run=args.dry_run,
+                )
+                if summaries:
+                    print("\n" + format_summary_table(summaries))
+            elif "align" in args.steps:
                 align_samples(fastqs_dir, bams_dir, config, dry_run=args.dry_run)
-            if "qc" in args.steps:
+            elif "qc" in args.steps:
                 summaries = qc_samples(
                     args.run_dir, fastqs_dir, bams_dir, args.sampleinfo, config,
-                    workers=args.workers, reference=args.picard_ref, dry_run=args.dry_run,
+                    workers=args.workers, reference=args.picard_ref,
+                    picard_xmx=args.picard_xmx, dry_run=args.dry_run,
                 )
                 if summaries:
                     print("\n" + format_summary_table(summaries))

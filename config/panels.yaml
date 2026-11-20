@@ -3,6 +3,8 @@ defaults:
   fastqs_dir: /staging/hot/reads
   dragen_tmp_dir: /staging/tmp
   picard_ref: /mnt/pns/tracks/ref/hg38.fa
+  picard_xmx: 4g
+  qc_workers: 4
   platform: NovaSeq6000
 
 # Maps BCLConvert index directory (from SampleSheet_<index>.csv) to DRAGEN alignment settings.
