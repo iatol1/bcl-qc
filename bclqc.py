@@ -89,6 +89,7 @@ def parse_arguments():
     parser.add_argument("--bams-dir", help="Parent directory where BAMs will be output", default=BAMS_DIR_DEFAULT)
     parser.add_argument("--sampleinfo", help="Path to the sampleinfo file for determining QC parameters.")
     parser.add_argument("--steps", nargs='+', help="Run only the specified steps (demux, align, qc)", default=DEF_STEPS)
+    parser.add_argument("--samples", nargs='+', default=None, help="Optional list of Sample_IDs to process in align (default: all samples)")
     return parser.parse_args()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -340,15 +341,17 @@ def demux_samples(run_dir, fastqs_dir):
         demux(run_dir, samplesheet, fastq_output)
     logging.info("Demux step completed")
 
-def align_samples(fastqs_dir, bams_dir):
+def align_samples(fastqs_dir, bams_dir, samples=None):
     """
     Execute the alignment step.
 
     Args:
         fastqs_dir (str): Path to the FASTQ directory.
         bams_dir (str): Path to the BAM output directory.
+        samples (list, optional): Subset of Sample_IDs to align; defaults to all.
     """
     logging.info("Starting align step")
+    sample_filter = set(samples) if samples else None
 
     fastq_lists = [os.path.join(root, file) for root, _, files in os.walk(fastqs_dir) for file in files if file == "fastq_list.csv"]
     for fastq_list in fastq_lists:
@@ -363,7 +366,9 @@ def align_samples(fastqs_dir, bams_dir):
             error_msg = "Could not determine bed file for fastq list: " + fastq_list
             logging.error(error_msg)
             raise Exception(error_msg)
-        for sample_id in get_sample_ids(fastq_list):
+        for sample_id in sorted(get_sample_ids(fastq_list)):
+            if sample_filter is not None and sample_id not in sample_filter:
+                continue
             bam_output = os.path.join(bams_dir, sample_id)
             if os.path.exists(bam_output):
                 logging.info(f"Skipping alignment for {sample_id} as output directory already exists: {bam_output}")
@@ -533,14 +538,15 @@ def bclqc_run():
     steps = args.steps
     run_dir = args.run_dir
     sampleinfo = args.sampleinfo
-    run_name = run_dir.split('/')[4]
-    fastqs_dir = args.fastqs_dir + '/' + run_name
-    bams_dir = args.bams_dir + '/' + run_name
+    samples = args.samples
+    run_name = os.path.basename(run_dir.rstrip('/'))
+    fastqs_dir = os.path.join(args.fastqs_dir, run_name)
+    bams_dir = os.path.join(args.bams_dir, run_name)
 
     if "demux" in steps:
         demux_samples(run_dir, fastqs_dir)
     if "align" in steps:
-        align_samples(fastqs_dir, bams_dir)
+        align_samples(fastqs_dir, bams_dir, samples=samples)
     if "qc" in steps:
         if not sampleinfo:
             logging.error("Sampleinfo file not found, cannot determine panel for QCSum.")
