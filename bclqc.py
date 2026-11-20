@@ -1,15 +1,17 @@
-import os
-import re
-import subprocess
 import argparse
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from interop import py_interop_run_metrics, py_interop_run, py_interop_table
-from numpy import zeros, float32
-import shlex  # For safely constructing shell commands
+import glob
 import logging  # For more robust logging
+import os
+import shlex  # For safely constructing shell commands
+import subprocess
 from multiprocessing import Pool
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+from interop import py_interop_run, py_interop_run_metrics, py_interop_table
+from numpy import float32, zeros
+
 from picard_qcsum import (
     PICARD_REF,
     QC_SUM_HEADER,
@@ -49,7 +51,7 @@ SAMPLEINFO_PANEL_TO_QCSUM_PANEL = {
 }
 
 
-def parse_arguments():
+def parse_arguments(argv=None):
     """
     Parses command line arguments for the bcl-qc pipeline.
     """
@@ -60,7 +62,10 @@ def parse_arguments():
     parser.add_argument("--bams-dir", help="Parent directory where BAMs will be output", default=BAMS_DIR_DEFAULT)
     parser.add_argument("--sampleinfo", help="Path to the sampleinfo file for determining QC parameters.")
     parser.add_argument("--steps", nargs='+', help="Run only the specified steps (demux, align, qc)", default=DEF_STEPS)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if "qc" in args.steps and not args.sampleinfo:
+        parser.error("--sampleinfo is required when running the 'qc' step")
+    return args
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -190,8 +195,13 @@ def multiqc(fastqs_dir, bams_dir):
         bams_dir (str): Directory containing BAM/CRAM files.
     """
     logging.info(f"Starting MultiQC report generation, FASTQ dir: {fastqs_dir}, BAM dir: {bams_dir}")
-    rm_cmd = ["rm", "-f", f"{bams_dir}/*/*.wgs_*.csv"] # Remove wgs coverage reports since they are irrelevant to targeted panels
-    exec_command(rm_cmd)
+    # Remove wgs coverage reports since they are irrelevant to targeted panels
+    for wgs_csv in glob.glob(os.path.join(bams_dir, "*", "*.wgs_*.csv")):
+        try:
+            os.remove(wgs_csv)
+            logging.info(f"Removed irrelevant WGS coverage report: {wgs_csv}")
+        except FileNotFoundError:
+            pass
 
     multiqc_cmd = [
         "multiqc",
@@ -461,25 +471,25 @@ def save_occ_pf_plot(run_dir, output_dir):
         plt.close()
     logging.info(f"Occupied vs Pass Filter plot saved to: {output_dir}")
 
-def bclqc_run():
+def bclqc_run(argv=None):
     """
     Main function to execute the bcl-qc pipeline.
     """
-    args = parse_arguments()
+    args = parse_arguments(argv)
     steps = args.steps
     run_dir = args.run_dir
     sampleinfo = args.sampleinfo
-    run_name = run_dir.split('/')[4]
-    fastqs_dir = args.fastqs_dir + '/' + run_name
-    bams_dir = args.bams_dir + '/' + run_name
+    run_name = os.path.basename(os.path.normpath(run_dir))
+    if not run_name or run_name in (".", "..", os.sep):
+        raise ValueError(f"Could not derive run name from --run-dir: {run_dir!r}")
+    fastqs_dir = os.path.join(args.fastqs_dir, run_name)
+    bams_dir = os.path.join(args.bams_dir, run_name)
 
     if "demux" in steps:
         demux_samples(run_dir, fastqs_dir)
     if "align" in steps:
         align_samples(fastqs_dir, bams_dir)
     if "qc" in steps:
-        if not sampleinfo:
-            logging.error("Sampleinfo file not found, cannot determine panel for QCSum.")
         qc_samples(run_dir, fastqs_dir, bams_dir, sampleinfo)
 
     logging.info("BCL QC pipeline run completed.")

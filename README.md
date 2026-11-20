@@ -49,9 +49,26 @@ conda env create -qn bclqc -f config/conda_env.yaml
 conda activate bclqc
 ```
 
-Now you can trigger demux, alignment, and MultiQC on a sequencer run output folder as follows.
+Now you can trigger demux, alignment, and QC on a sequencer run output folder as follows:
 ```bash
-python bclqc.py $PWD/reads $PWD/bams $PWD/demo_run
+python bclqc.py --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams --sampleinfo /path/to/sampleinfo.tsv
+```
+
+### Standalone Picard QC Summary (`picard_qcsum.py`)
+
+You can also run Picard `CollectHsMetrics` and generate QC summary CSVs directly on individual CRAM/BAM files or batches without running the full `bclqc.py` pipeline:
+```bash
+# List available panels and QC cutoffs
+python picard_qcsum.py --list-panels
+
+# Single sample
+python picard_qcsum.py --cram /path/to/sample.cram --panel pcp_tumor -o /path/to/output
+
+# Parallel batch mode (runs Picard across CRAMs and merges into merged_qcsum.csv)
+python picard_qcsum.py --batch sample1.cram sample2.cram --panel heme_comp --threads 4 -o /path/to/output
+
+# Merge existing per-sample .qcsum.txt files
+python picard_qcsum.py --merge sample1.qcsum.txt sample2.qcsum.txt -o /path/to/output
 ```
 
 ### Demo data
@@ -62,12 +79,12 @@ curl -sL https://launch.basespace.illumina.com/CLI/latest/amd64-linux/bs -o $CON
 chmod +x $CONDA_PREFIX/bin/bs
 ```
 
-Run `bs auth` and follow the instructions to login to the CLI. Then download the run output folder from Illumina as follows. Skip their SampleSheet, because we have a more minimal version in this repo under `demo_run/SampleSheet_I10.csv`.
+Run `bs auth` and follow the instructions to login to the CLI. Then download the run output folder from Illumina as follows. Skip their SampleSheet, because we have a more minimal version in this repo under `demo_run/SampleSheet_I8.csv`.
 ```bash
 bs download run --summary --id 72750678 --output demo_run --exclude SampleSheet*.csv
 ```
 
 You can test the demux pass on this demo data as follows and inspect the output in the new folder named `reads`:
 ```bash
-python bclqc.py -P demux $PWD/reads $PWD/bams $PWD/demo_run
+python bclqc.py --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams --steps demux
 ```

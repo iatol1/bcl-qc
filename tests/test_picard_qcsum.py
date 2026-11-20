@@ -2,13 +2,12 @@
 
 import csv
 import io
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import picard_qcsum
-
 
 # Full Picard 3.3.0 CollectHsMetrics header columns (0-indexed to match Picard HsMetrics.java)
 PICARD_HSM_HEADERS = [
@@ -508,8 +507,7 @@ class TestBclqcIntegration(unittest.TestCase):
                     self._rows = rows
 
                 def iterrows(self):
-                    for idx, row in enumerate(self._rows):
-                        yield idx, row
+                    yield from enumerate(self._rows)
 
             def _read_csv(path, sep=","):
                 with open(path) as f:
@@ -560,6 +558,45 @@ class TestBclqcIntegration(unittest.TestCase):
                 [(r["Sample"], r["Tumor_Normal"], r["Capture"], r["%On_Bait_Bases"], r["%On_Target_Bases"]) for r in rows],
                 [("H1", "", "goal", "72.00", "61.50")],
             )
+
+    def test_multiqc_removes_wgs_csvs_via_glob(self):
+        bclqc = self._import_bclqc()
+        with tempfile.TemporaryDirectory() as tmp:
+            bams = Path(tmp) / "bams"
+            fastqs = Path(tmp) / "fastqs"
+            sample_dir = bams / "S1"
+            sample_dir.mkdir(parents=True)
+            fastqs.mkdir()
+            wgs_file = sample_dir / "S1.wgs_coverage_metrics.csv"
+            keep_file = sample_dir / "S1.target_bed_coverage_metrics.csv"
+            wgs_file.write_text("dummy\n")
+            keep_file.write_text("keep\n")
+
+            with mock.patch.object(bclqc, "exec_command") as mock_exec:
+                bclqc.multiqc(str(fastqs), str(bams))
+                mock_exec.assert_called_once()
+                cmd = mock_exec.call_args[0][0]
+                self.assertEqual(cmd[0], "multiqc")
+
+            self.assertFalse(wgs_file.exists())
+            self.assertTrue(keep_file.exists())
+
+    def test_bclqc_run_name_parsing_and_missing_sampleinfo(self):
+        bclqc = self._import_bclqc()
+        # Missing --sampleinfo with qc step fails fast with argparse exit code 2
+        with self.assertRaises(SystemExit) as ctx:
+            bclqc.parse_arguments(["--run-dir", "/tmp/runs/RUN_01", "--steps", "qc"])
+        self.assertEqual(ctx.exception.code, 2)
+
+        # Path depth and trailing slash should not break run_name extraction
+        with mock.patch.object(bclqc, "demux_samples") as mock_demux:
+            bclqc.bclqc_run([
+                "--run-dir", "/short/path/RUN_42/",
+                "--fastqs-dir", "/out/reads",
+                "--bams-dir", "/out/bams",
+                "--steps", "demux",
+            ])
+            mock_demux.assert_called_once_with("/short/path/RUN_42/", "/out/reads/RUN_42")
 
 
 if __name__ == "__main__":
