@@ -11,6 +11,7 @@ import shlex  # For safely constructing shell commands
 import logging  # For more robust logging
 from multiprocessing import Pool
 import yaml
+from samplesheet import write_filtered_samplesheet
 
 # --- Configuration ---
 BAMS_DIR_DEFAULT = "/mnt/pns/bams/"
@@ -89,6 +90,7 @@ def parse_arguments():
     parser.add_argument("--bams-dir", help="Parent directory where BAMs will be output", default=BAMS_DIR_DEFAULT)
     parser.add_argument("--sampleinfo", help="Path to the sampleinfo file for determining QC parameters.")
     parser.add_argument("--steps", nargs='+', help="Run only the specified steps (demux, align, qc)", default=DEF_STEPS)
+    parser.add_argument("--samples", nargs='+', default=None, help="Optional list of Sample_IDs to process in demux/align (default: all samples)")
     return parser.parse_args()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -320,13 +322,14 @@ def qcsum(bams_dir, sampleinfo):
         outfile.write("\n")
     logging.info(f"qcsum.sh execution completed for directory: {bams_dir}")
 
-def demux_samples(run_dir, fastqs_dir):
+def demux_samples(run_dir, fastqs_dir, samples=None):
     """
     Execute the demultiplexing step.
 
     Args:
         run_dir (str): Path to the run directory.
         fastqs_dir (str): Path to the FASTQ output directory.
+        samples (list, optional): Subset of Sample_IDs to demux; defaults to all.
     """
     logging.info("Starting demux step")
     if os.path.exists(fastqs_dir):
@@ -335,20 +338,41 @@ def demux_samples(run_dir, fastqs_dir):
         raise Exception(error_msg)
     os.makedirs(fastqs_dir, exist_ok=True)
     samplesheets = get_samplesheets(run_dir)
-    for samplesheet in samplesheets:
-        fastq_output = f"{fastqs_dir}/{get_index(samplesheet)}"
-        demux(run_dir, samplesheet, fastq_output)
+    if samples:
+        requested = set(samples)
+        matched_all = set()
+        filtered_dir = os.path.join(fastqs_dir, "_filtered_samplesheets")
+        for samplesheet in samplesheets:
+            filtered_sheet = os.path.join(filtered_dir, os.path.basename(samplesheet))
+            matched = write_filtered_samplesheet(samplesheet, filtered_sheet, requested)
+            if not matched:
+                logging.info(f"Skipping samplesheet {samplesheet}: no requested samples matched")
+                continue
+            matched_all.update(matched)
+            fastq_output = f"{fastqs_dir}/{get_index(samplesheet)}"
+            demux(run_dir, filtered_sheet, fastq_output)
+        if not matched_all:
+            raise ValueError(f"None of the requested samples {sorted(requested)} were found in any SampleSheet in {run_dir}")
+        missing = requested - matched_all
+        if missing:
+            logging.warning(f"Requested samples not found in SampleSheets in {run_dir}: {sorted(missing)}")
+    else:
+        for samplesheet in samplesheets:
+            fastq_output = f"{fastqs_dir}/{get_index(samplesheet)}"
+            demux(run_dir, samplesheet, fastq_output)
     logging.info("Demux step completed")
 
-def align_samples(fastqs_dir, bams_dir):
+def align_samples(fastqs_dir, bams_dir, samples=None):
     """
     Execute the alignment step.
 
     Args:
         fastqs_dir (str): Path to the FASTQ directory.
         bams_dir (str): Path to the BAM output directory.
+        samples (list, optional): Subset of Sample_IDs to align; defaults to all.
     """
     logging.info("Starting align step")
+    sample_filter = set(samples) if samples else None
 
     fastq_lists = [os.path.join(root, file) for root, _, files in os.walk(fastqs_dir) for file in files if file == "fastq_list.csv"]
     for fastq_list in fastq_lists:
@@ -363,7 +387,9 @@ def align_samples(fastqs_dir, bams_dir):
             error_msg = "Could not determine bed file for fastq list: " + fastq_list
             logging.error(error_msg)
             raise Exception(error_msg)
-        for sample_id in get_sample_ids(fastq_list):
+        for sample_id in sorted(get_sample_ids(fastq_list)):
+            if sample_filter is not None and sample_id not in sample_filter:
+                continue
             bam_output = os.path.join(bams_dir, sample_id)
             if os.path.exists(bam_output):
                 logging.info(f"Skipping alignment for {sample_id} as output directory already exists: {bam_output}")
@@ -533,14 +559,15 @@ def bclqc_run():
     steps = args.steps
     run_dir = args.run_dir
     sampleinfo = args.sampleinfo
-    run_name = run_dir.split('/')[4]
-    fastqs_dir = args.fastqs_dir + '/' + run_name
-    bams_dir = args.bams_dir + '/' + run_name
+    samples = args.samples
+    run_name = os.path.basename(run_dir.rstrip('/'))
+    fastqs_dir = os.path.join(args.fastqs_dir, run_name)
+    bams_dir = os.path.join(args.bams_dir, run_name)
 
     if "demux" in steps:
-        demux_samples(run_dir, fastqs_dir)
+        demux_samples(run_dir, fastqs_dir, samples=samples)
     if "align" in steps:
-        align_samples(fastqs_dir, bams_dir)
+        align_samples(fastqs_dir, bams_dir, samples=samples)
     if "qc" in steps:
         if not sampleinfo:
             logging.error("Sampleinfo file not found, cannot determine panel for QCSum.")
