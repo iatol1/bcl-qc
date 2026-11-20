@@ -49,10 +49,26 @@ conda env create -qn bclqc -f config/conda_env.yaml
 conda activate bclqc
 ```
 
-Now you can trigger demux, alignment, and MultiQC on a sequencer run output folder as follows.
+Now you can trigger the full pipeline (or individual steps) via subcommands in `bclqc.py`:
 ```bash
-python bclqc.py $PWD/reads $PWD/bams $PWD/demo_run
+# Full pipeline (overlaps Picard QC with DRAGEN alignment automatically)
+python bclqc.py run --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams --sampleinfo /path/to/sampleinfo.tsv
+
+# Individual steps
+python bclqc.py demux --run-dir $PWD/demo_run --fastqs-dir $PWD/reads
+python bclqc.py align --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams
+python bclqc.py qc    --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams --sampleinfo /path/to/sampleinfo.tsv
+
+# Standalone Picard CollectHsMetrics + QCSum (1 or more CRAM/BAMs)
+python bclqc.py qcsum /path/to/sample.cram --panel pcp_tumor -o /path/to/output
+python bclqc.py qcsum sample1.cram sample2.cram --panel heme_comp -t 4 --picard-xmx 4g -o /path/to/output
+
+# Merge existing per-sample .qcsum.txt files or inspect configured panels
+python bclqc.py merge sample1.qcsum.txt sample2.qcsum.txt -o /path/to/output
+python bclqc.py panels
 ```
+
+All alignment groups, DRAGEN panel flags, sampleinfo aliases, reference defaults, and QC thresholds are configured in a single file: `config/panels.yaml`.
 
 ### Demo data
 
@@ -62,12 +78,12 @@ curl -sL https://launch.basespace.illumina.com/CLI/latest/amd64-linux/bs -o $CON
 chmod +x $CONDA_PREFIX/bin/bs
 ```
 
-Run `bs auth` and follow the instructions to login to the CLI. Then download the run output folder from Illumina as follows. Skip their SampleSheet, because we have a more minimal version in this repo under `demo_run/SampleSheet_I10.csv`.
+Run `bs auth` and follow the instructions to login to the CLI. Then download the run output folder from Illumina as follows. Skip their SampleSheet, because we have a more minimal version in this repo under `demo_run/SampleSheet_I8.csv`.
 ```bash
 bs download run --summary --id 72750678 --output demo_run --exclude SampleSheet*.csv
 ```
 
 You can test the demux pass on this demo data as follows and inspect the output in the new folder named `reads`:
 ```bash
-python bclqc.py -P demux $PWD/reads $PWD/bams $PWD/demo_run
+python bclqc.py demux --run-dir $PWD/demo_run --fastqs-dir $PWD/reads
 ```

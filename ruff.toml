@@ -1,0 +1,16 @@
+# Ruff configuration for bcl-qc (mirrors mdl-pipelines)
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort (import sorting)
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line length handled pragmatically
+    "UP022", # explicit stdout=PIPE/stderr=PIPE kept for clarity
+]
