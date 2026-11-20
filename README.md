@@ -49,27 +49,26 @@ conda env create -qn bclqc -f config/conda_env.yaml
 conda activate bclqc
 ```
 
-Now you can trigger demux, alignment, and QC on a sequencer run output folder as follows:
+Now you can trigger the full pipeline (or individual steps) via subcommands in `bclqc.py`:
 ```bash
-python bclqc.py --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams --sampleinfo /path/to/sampleinfo.tsv
+# Full pipeline (overlaps Picard QC with DRAGEN alignment automatically)
+python bclqc.py run --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams --sampleinfo /path/to/sampleinfo.tsv
+
+# Individual steps
+python bclqc.py demux --run-dir $PWD/demo_run --fastqs-dir $PWD/reads
+python bclqc.py align --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams
+python bclqc.py qc    --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams --sampleinfo /path/to/sampleinfo.tsv
+
+# Standalone Picard CollectHsMetrics + QCSum (1 or more CRAM/BAMs)
+python bclqc.py qcsum /path/to/sample.cram --panel pcp_tumor -o /path/to/output
+python bclqc.py qcsum sample1.cram sample2.cram --panel heme_comp -t 4 --picard-xmx 4g -o /path/to/output
+
+# Merge existing per-sample .qcsum.txt files or inspect configured panels
+python bclqc.py merge sample1.qcsum.txt sample2.qcsum.txt -o /path/to/output
+python bclqc.py panels
 ```
 
-### Standalone Picard QC Summary (`picard_qcsum.py`)
-
-You can also run Picard `CollectHsMetrics` and generate QC summary CSVs directly on individual CRAM/BAM files or batches without running the full `bclqc.py` pipeline:
-```bash
-# List available panels and QC cutoffs
-python picard_qcsum.py --list-panels
-
-# Single sample
-python picard_qcsum.py --cram /path/to/sample.cram --panel pcp_tumor -o /path/to/output
-
-# Parallel batch mode (runs Picard across CRAMs and merges into merged_qcsum.csv)
-python picard_qcsum.py --batch sample1.cram sample2.cram --panel heme_comp --threads 4 -o /path/to/output
-
-# Merge existing per-sample .qcsum.txt files
-python picard_qcsum.py --merge sample1.qcsum.txt sample2.qcsum.txt -o /path/to/output
-```
+All alignment groups, DRAGEN panel flags, sampleinfo aliases, reference defaults, and QC thresholds are configured in a single file: `config/panels.yaml`.
 
 ### Demo data
 
@@ -86,5 +85,5 @@ bs download run --summary --id 72750678 --output demo_run --exclude SampleSheet*
 
 You can test the demux pass on this demo data as follows and inspect the output in the new folder named `reads`:
 ```bash
-python bclqc.py --run-dir $PWD/demo_run --fastqs-dir $PWD/reads --bams-dir $PWD/bams --steps demux
+python bclqc.py demux --run-dir $PWD/demo_run --fastqs-dir $PWD/reads
 ```
