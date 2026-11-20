@@ -47,7 +47,6 @@ qc_panels:
     target_intervals: /mnt/pns/tracks/ucla_mdl_cancer_ngs_v1_exon_targets.hg38.ilist
     pipeline_version: PCPTNDx-v2.0
     capture: twist
-    capture_version: v1.0
     covered: 250
     fail_min_align_pct: 97.0
     fail_min_roi_pct: 90
@@ -69,7 +68,6 @@ qc_panels:
     target_intervals: /mnt/pns/tracks/hemev2_roi.interval_list
     pipeline_version: HemeDx-v2.2.0
     capture: goal
-    capture_version: v1.0
     covered: 500
     fail_min_align_pct: 99.0
     fail_min_roi_pct: 85

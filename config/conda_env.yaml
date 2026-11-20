@@ -4,6 +4,7 @@ channels:
   - conda-forge
 dependencies:
   - python=3.12
+  - numpy
   - pyyaml>=6.0
   - picard=3.3.0
   - multiqc=1.23
